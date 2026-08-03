@@ -1,0 +1,198 @@
+﻿# ============================================================
+# SECRETS AND LOCAL CONFIGURATION
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+
+secrets/
+credentials/
+
+# Local Keycloak export may contain sensitive configuration
+infra/keycloak/pms-realm.json
+
+
+# ============================================================
+# AGENT INSTRUCTION FILES
+# ============================================================
+
+AGENTS.md
+**/AGENTS.md
+
+agent.md
+**/agent.md
+
+agents.md
+**/agents.md
+
+
+# ============================================================
+# PROJECT DATA AND DATABASE FILES
+# ============================================================
+
+data/
+docs/
+datasets/
+uploads/
+documents/
+corpus/
+raw_data/
+processed_data/
+database_backups/
+
+*.dump
+*.backup
+*.bak
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+*.feather
+
+
+# ============================================================
+# SENSITIVE OR GENERATED DOCUMENTATION
+# ============================================================
+
+docs/data_dictionary/
+docs/phase_reports/
+docs/phase_approvals/
+docs/codex/
+docs/security/
+docs/demo/
+docs/GITHUB_PUBLISHING_CHECKLIST.md
+
+
+# ============================================================
+# DOCUMENTS, ARCHIVES AND LOCAL ARTIFACTS
+# ============================================================
+
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.csv
+*.zip
+*.7z
+*.rar
+
+artifacts/
+outputs/
+reports/
+models/
+
+
+# ============================================================
+# PYTHON GENERATED FILES
+# ============================================================
+
+.venv/
+venv/
+
+__pycache__/
+**/__pycache__/
+
+*.py[cod]
+*.egg-info/
+**/*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+
+# ============================================================
+# NODE, REACT AND TYPESCRIPT GENERATED FILES
+# ============================================================
+
+node_modules/
+dist/
+build/
+.vite/
+
+*.tsbuildinfo
+
+
+# ============================================================
+# JUPYTER GENERATED FILES
+# ============================================================
+
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+.virtual_documents/
+**/.virtual_documents/
+
+*.ipynb
+
+
+# ============================================================
+# TEMPORARY, OCR AND LOG FILES
+# ============================================================
+
+tmp/
+temp/
+
+*.tmp
+*.temp
+*.log
+*.lock
+*.err
+*.out
+
+.codex_tmp/
+
+
+# ============================================================
+# IDE AND OPERATING-SYSTEM FILES
+# ============================================================
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ============================================================
+# DOCKER LOCAL STATE
+# ============================================================
+
+docker-data/
+postgres-data/
+minio-data/
+volumes/
+
+
+# ============================================================
+# BACKUP AND GENERATED CONFIGURATION FILES
+# ============================================================
+
+*.before-*
+*.old
+*.orig
+
+migration_*_preview.sql
+migration_*_only.sql
+
+
+# ============================================================
+# ACCIDENTALLY CREATED MALFORMED FILES
+# ============================================================
+
+ers15dhaOneDriveDesktopfinal_projectAI_Powered_PMS*
+et
+sword=*
+

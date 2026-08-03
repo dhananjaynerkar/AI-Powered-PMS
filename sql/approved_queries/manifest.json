@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "templates": {
+    "tenant_profile": {
+      "file": "tenant_profile.sql",
+      "domain": "tenant",
+      "view": "tenant_360"
+    },
+    "tenancy_profile": {
+      "file": "tenancy_profile.sql",
+      "domain": "tenancy",
+      "view": "tenancy_360"
+    },
+    "plot_profile": {
+      "file": "plot_profile.sql",
+      "domain": "plot",
+      "view": "plot_360"
+    },
+    "current_agreement": {
+      "file": "current_agreement.sql",
+      "domain": "agreement",
+      "view": "agreement_360"
+    },
+    "bills": {
+      "file": "bills.sql",
+      "domain": "bill",
+      "view": "bill_360"
+    },
+    "payments": {
+      "file": "payments.sql",
+      "domain": "payment",
+      "view": "payment_360"
+    },
+    "outstanding": {
+      "file": "outstanding.sql",
+      "domain": "outstanding",
+      "view": "outstanding_360"
+    },
+    "inspections": {
+      "file": "inspections.sql",
+      "domain": "inspection",
+      "view": "inspection_360"
+    },
+    "legal_cases": {
+      "file": "legal_cases.sql",
+      "domain": "legal_case",
+      "view": "legal_case_360"
+    }
+  }
+}

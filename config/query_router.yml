@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "structured_templates": {
+    "tenant": "tenant_profile",
+    "tenancy": "tenancy_profile",
+    "plot": "plot_profile",
+    "agreement": "current_agreement",
+    "bill": "bills",
+    "payment": "payments",
+    "outstanding": "outstanding",
+    "inspection": "inspections",
+    "legal_case": "legal_cases"
+  },
+  "document_domains": ["policy", "act", "circular", "office order", "clause"],
+  "forecast_domains": ["forecast", "prediction", "predict", "projection"],
+  "rule_domains": ["calculate", "calculation", "tax calculation", "rent escalation"],
+  "refuse_patterns": [
+    "ignore previous instructions",
+    "system prompt",
+    "drop table",
+    "truncate table",
+    "alter table",
+    "select *",
+    "--",
+    ";"
+  ]
+}

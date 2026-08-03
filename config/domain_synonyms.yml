@@ -1,0 +1,13 @@
+{
+  "tenant": ["tenant", "tenants", "customer", "customers", "applicant", "applicants"],
+  "tenancy": ["tenancy", "tenancies", "allotment", "allotments"],
+  "plot": ["plot", "plots", "land parcel", "land parcels", "property", "properties"],
+  "agreement": ["agreement", "agreements", "lease", "leases", "contract", "contracts"],
+  "bill": ["bill", "bills", "invoice", "invoices", "demand", "demands"],
+  "payment": ["payment", "payments", "receipt", "receipts", "collection", "collections"],
+  "outstanding": ["outstanding", "arrears", "amount due"],
+  "inspection": ["inspection", "inspections", "site visit", "site visits"],
+  "legal_case": ["legal case", "legal cases", "court case", "court cases", "suit", "suits", "litigation"],
+  "policy": ["policy", "act", "circular", "office order", "clause"],
+  "prediction": ["forecast", "prediction", "predict", "projection"]
+}
