@@ -139,7 +139,7 @@ class QueryUnderstanding(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    normalized_query: str = Field(min_length=1, max_length=2000)
+    normalized_query: str = Field(min_length=1, max_length=4000)
     query_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     as_of_date: date
     mentioned_dates: tuple[date, ...]
@@ -198,6 +198,16 @@ class SourceCitation(BaseModel):
     section_number: str | None
     clause_number: str | None
     citations: tuple[ChunkCitation, ...]
+
+
+class CorpusStatus(BaseModel):
+    """Authorization-scoped availability of the live indexed corpus."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    indexed_documents: int = Field(ge=0)
+    accepted_parent_chunks: int = Field(ge=0)
+    embedded_child_chunks: int = Field(ge=0)
 
 
 class RetrievalTrace(BaseModel):

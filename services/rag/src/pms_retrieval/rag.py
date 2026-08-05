@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import json
 import time
 from collections.abc import Sequence
 from datetime import date
@@ -31,6 +31,7 @@ from pms_retrieval.generation import (
 )
 from pms_retrieval.models import (
     ContextEvidence,
+    CorpusStatus,
     GroundedAnswer,
     QueryUnderstanding,
     RankedEvidence,
@@ -41,6 +42,7 @@ from pms_retrieval.models import (
 )
 from pms_retrieval.query import (
     document_pattern,
+    lexical_search_query,
     reciprocal_rank_fusion,
     understand_query,
 )
@@ -93,6 +95,8 @@ class RagRepository(Protocol):
         as_of_date: date,
     ) -> tuple[RetrievalHit, ...]: ...
 
+    def corpus_status(self) -> CorpusStatus: ...
+
     def audit(
         self,
         understanding: QueryUnderstanding,
@@ -100,6 +104,7 @@ class RagRepository(Protocol):
         *,
         model_version: str | None,
         result_status: str,
+        entity_scope: dict[str, str],
     ) -> None: ...
 
 
@@ -165,6 +170,10 @@ class PostgresRagRepository:
                 self._context,
             ).parent_chunks(parent_chunk_ids, as_of_date=as_of_date)
 
+    def corpus_status(self) -> CorpusStatus:
+        with self._engine.begin() as connection:
+            return PostgresChunkRepository(connection, self._context).corpus_status()
+
     def audit(
         self,
         understanding: QueryUnderstanding,
@@ -172,6 +181,7 @@ class PostgresRagRepository:
         *,
         model_version: str | None,
         result_status: str,
+        entity_scope: dict[str, str],
     ) -> None:
         with self._engine.begin() as connection:
             apply_postgres_session_context(connection, self._context)
@@ -183,6 +193,7 @@ class PostgresRagRepository:
                     entity_scope={
                         "query_hash": understanding.query_hash,
                         "as_of_date": understanding.as_of_date.isoformat(),
+                        **entity_scope,
                     },
                     source_ids=source_ids,
                     model_version=model_version,
@@ -214,6 +225,15 @@ class HybridRagService:
         self._generator = generator or OllamaGenerator(settings)
         self._tokenizer = tokenizer or BgeM3Tokenizer(settings)
 
+    def corpus_status(self) -> CorpusStatus:
+        return self._repository.corpus_status()
+
+    def generation_model_state(self) -> str:
+        runtime_state = getattr(self._generator, "runtime_state", None)
+        if not callable(runtime_state):
+            return "unavailable"
+        return str(runtime_state(self._settings.llm_primary_model))
+
     def ask(
         self,
         query: str,
@@ -221,7 +241,7 @@ class HybridRagService:
         response_language: ResponseLanguage = ResponseLanguage.AUTO,
         include_trace: bool = False,
         today: date | None = None,
-        use_extractive_fallback: bool = False,
+        lexical_only: bool = False,
     ) -> GroundedAnswer:
         started = time.perf_counter()
         durations: dict[str, float] = {}
@@ -229,44 +249,67 @@ class HybridRagService:
             query,
             today=today,
             response_language=response_language,
+            maximum_length=self._settings.query_max_length,
         )
         pattern = document_pattern(understanding.document_type)
 
         stage = time.perf_counter()
-        lexical = self._repository.lexical_search(
+        lexical_query = lexical_search_query(
             understanding.normalized_query,
+            maximum_length=self._settings.query_max_length,
+        )
+        lexical = self._repository.lexical_search(
+            lexical_query,
             self._settings.lexical_top_k,
             as_of_date=understanding.as_of_date,
             document_pattern=pattern,
         )
+        if not lexical and pattern is not None:
+            lexical = self._repository.lexical_search(
+                lexical_query,
+                self._settings.lexical_top_k,
+                as_of_date=understanding.as_of_date,
+                document_pattern=None,
+            )
         durations["lexical"] = _elapsed_ms(stage)
 
+        dense: tuple[RetrievalHit, ...] = ()
         stage = time.perf_counter()
-        query_vectors = self._embedder.embed((understanding.normalized_query,))
-        if len(query_vectors) != 1:
-            raise GenerationError("query embedding count is invalid")
-        dense = self._repository.dense_search(
-            query_vectors[0],
-            model=self._embedder.model,
-            revision=self._embedder.revision,
-            limit=self._settings.dense_top_k,
-            as_of_date=understanding.as_of_date,
-            document_pattern=pattern,
-        )
-        durations["dense"] = _elapsed_ms(stage)
-
-        stage = time.perf_counter()
-        fused = reciprocal_rank_fusion(
-            lexical,
-            dense,
-            k=self._settings.rrf_k,
-            limit=self._settings.rerank_input_top_k,
-        )
-        reranked = self._reranker.rerank(
-            understanding.normalized_query,
-            fused,
-            self._settings.rerank_output_top_k,
-        )
+        if lexical_only:
+            fused = reciprocal_rank_fusion(
+                lexical,
+                dense,
+                k=self._settings.rrf_k,
+                limit=self._settings.rerank_input_top_k,
+            )
+            reranked = fused[: self._settings.rerank_output_top_k]
+            durations["dense"] = 0.0
+        else:
+            query_vectors = self._embedder.embed((understanding.normalized_query,))
+            if len(query_vectors) != 1:
+                raise GenerationError("query embedding count is invalid")
+            dense = self._repository.dense_search(
+                query_vectors[0],
+                model=self._embedder.model,
+                revision=self._embedder.revision,
+                limit=self._settings.dense_top_k,
+                as_of_date=understanding.as_of_date,
+                document_pattern=pattern,
+            )
+            durations["dense"] = _elapsed_ms(stage)
+            stage = time.perf_counter()
+            fused = reciprocal_rank_fusion(
+                lexical,
+                dense,
+                k=self._settings.rrf_k,
+                limit=self._settings.rerank_input_top_k,
+            )
+            reranked = self._reranker.rerank(
+                understanding.normalized_query,
+                fused,
+                self._settings.rerank_output_top_k,
+            )
+        reranked = _prioritize_definition_evidence(lexical_query, reranked)
         reranked = self._deduplicate_translations(reranked)
         if self._settings.retrieval_min_score is not None:
             reranked = tuple(
@@ -281,10 +324,13 @@ class HybridRagService:
         context = self._build_context(reranked, understanding.as_of_date)
         durations["parent_context"] = _elapsed_ms(stage)
         if not context:
+            durations["total"] = _elapsed_ms(started)
             answer = self._refusal(understanding, "INSUFFICIENT_AUTHORIZED_EVIDENCE")
-            self._repository.audit(
+            self._audit(
                 understanding,
                 (),
+                reranked,
+                durations,
                 model_version=None,
                 result_status="REVIEW_REQUIRED",
             )
@@ -308,12 +354,9 @@ class HybridRagService:
 
         warnings = list(_context_warnings(context))
         stage = time.perf_counter()
-        draft, fallback_used = self._generate(
-            understanding,
-            context,
-            use_extractive_fallback=use_extractive_fallback,
-        )
+        draft, fallback_used = self._generate(understanding, context)
         durations["generation"] = _elapsed_ms(stage)
+        durations["citation_validation"] = draft.citation_validation_ms
         durations["total"] = _elapsed_ms(started)
         warnings.extend(draft.warnings)
         trace = self._trace(
@@ -337,9 +380,11 @@ class HybridRagService:
                     "trace": trace if self._trace_allowed(include_trace) else None,
                 }
             )
-            self._repository.audit(
+            self._audit(
                 understanding,
                 tuple(item.chunk_id for item in context),
+                reranked,
+                durations,
                 model_version=draft.model,
                 result_status="REVIEW_REQUIRED",
             )
@@ -359,111 +404,41 @@ class HybridRagService:
             model=draft.model,
             trace=trace if self._trace_allowed(include_trace) else None,
         )
-        self._repository.audit(
+        self._audit(
             understanding,
             tuple(item.chunk_id for item in context),
+            reranked,
+            durations,
             model_version=draft.model,
             result_status="REVIEW_REQUIRED" if result.review_required else "ALLOWED",
         )
         return result
 
-    def answer_verified_extractive_evidence(
+    def _audit(
         self,
-        query: str,
+        understanding: QueryUnderstanding,
+        source_ids: Sequence[str],
+        candidates: Sequence[RankedEvidence],
+        durations: dict[str, float],
         *,
-        document_id: str,
-        document_version_id: str,
-        parent_chunk_id: str,
-        child_chunk_id: str,
-    ) -> GroundedAnswer:
-        """Return a cited extract after an RLS-scoped lookup of one reviewed chunk.
-
-        Callers must limit this to a fixed, reviewed demonstration question. It is not a
-        general document-answering route and deliberately does not use an embedding model,
-        reranker or LLM.
-        """
-
-        understanding = understand_query(query)
-        hits = self._repository.lexical_search(
-            understanding.normalized_query,
-            10,
-            as_of_date=understanding.as_of_date,
-            document_pattern=None,
-        )
-        child = next(
-            (
-                item
-                for item in hits
-                if item.chunk_id == child_chunk_id
-                and item.parent_chunk_id == parent_chunk_id
-                and item.document_id == document_id
-                and item.document_version_id == document_version_id
-            ),
-            None,
-        )
-        if child is None:
-            return self._verified_evidence_refusal(understanding)
-        parent = next(
-            (
-                item
-                for item in self._repository.parent_chunks(
-                    (parent_chunk_id,), as_of_date=understanding.as_of_date
-                )
-                if item.chunk_id == parent_chunk_id
-                and item.document_id == document_id
-                and item.document_version_id == document_version_id
-            ),
-            None,
-        )
-        if parent is None:
-            return self._verified_evidence_refusal(understanding)
-        context = ContextEvidence(
-            source_id="S1",
-            chunk_id=parent.chunk_id,
-            child_chunk_ids=(child.chunk_id,),
-            document_id=parent.document_id,
-            document_version_id=parent.document_version_id,
-            document_title=parent.document_title,
-            text=parent.text,
-            supporting_text=child.text,
-            token_count=self._tokenizer.count(parent.text),
-            page_numbers=parent.page_numbers,
-            citations=parent.citations,
-            heading_path=parent.heading_path,
-            section_number=parent.section_number,
-            clause_number=parent.clause_number,
-            language_code=parent.language_code,
-            authoritative_language=parent.authoritative_language,
-            effective_from=parent.effective_from,
-            effective_to=parent.effective_to,
-            score=child.score,
-        )
-        draft = _extractive_evidence_draft((context,))
-        result = GroundedAnswer(
-            answer=draft.answer,
-            sources=(_source_citation(context),),
-            confidence="MEDIUM",
-            warnings=("VERIFIED_EXTRACTIVE_DEMO_EVIDENCE",),
-            review_required=False,
-            model=draft.model,
-        )
+        model_version: str | None,
+        result_status: str,
+    ) -> None:
         self._repository.audit(
             understanding,
-            (child.chunk_id, parent.chunk_id),
-            model_version=draft.model,
-            result_status="ALLOWED",
+            source_ids,
+            model_version=model_version,
+            result_status=result_status,
+            entity_scope={
+                "retrieved_document_ids": ",".join(
+                    dict.fromkeys(item.hit.document_id for item in candidates)
+                ),
+                "stage_durations_ms": json.dumps(
+                    {key: round(value, 3) for key, value in durations.items()},
+                    sort_keys=True,
+                ),
+            },
         )
-        return result
-
-    def _verified_evidence_refusal(self, understanding: QueryUnderstanding) -> GroundedAnswer:
-        result = self._refusal(understanding, "INSUFFICIENT_AUTHORIZED_EVIDENCE")
-        self._repository.audit(
-            understanding,
-            (),
-            model_version=None,
-            result_status="REVIEW_REQUIRED",
-        )
-        return result
 
     def _build_context(
         self,
@@ -485,17 +460,24 @@ class HybridRagService:
             )
         }
         selected: list[ContextEvidence] = []
+        selected_parent_ids: set[str] = set()
         used_tokens = 0
         for candidate in candidates:
             parent_id = candidate.hit.parent_chunk_id
             parent = parents.get(parent_id or "")
             if parent is None:
                 continue
-            if any(item.chunk_id == parent.chunk_id for item in selected):
+            if parent.chunk_id in selected_parent_ids:
                 continue
             token_count = self._tokenizer.count(parent.text)
+            source = parent
+            supporting_text: str | None = candidate.hit.text
             if token_count > self._settings.final_context_max_tokens - used_tokens:
-                continue
+                token_count = self._tokenizer.count(candidate.hit.text)
+                if token_count > self._settings.final_context_max_tokens - used_tokens:
+                    continue
+                source = candidate.hit
+                supporting_text = None
             score = (
                 candidate.rerank_score
                 if candidate.rerank_score is not None
@@ -509,26 +491,27 @@ class HybridRagService:
             selected.append(
                 ContextEvidence(
                     source_id=f"S{len(selected) + 1}",
-                    chunk_id=parent.chunk_id,
+                    chunk_id=source.chunk_id,
                     child_chunk_ids=child_ids,
-                    document_id=parent.document_id,
-                    document_version_id=parent.document_version_id,
-                    document_title=parent.document_title,
-                    text=parent.text,
-                    supporting_text=candidate.hit.text,
+                    document_id=source.document_id,
+                    document_version_id=source.document_version_id,
+                    document_title=source.document_title,
+                    text=source.text,
+                    supporting_text=supporting_text,
                     token_count=token_count,
-                    page_numbers=parent.page_numbers,
-                    citations=parent.citations,
-                    heading_path=parent.heading_path,
-                    section_number=parent.section_number,
-                    clause_number=parent.clause_number,
-                    language_code=parent.language_code,
-                    authoritative_language=parent.authoritative_language,
-                    effective_from=parent.effective_from,
-                    effective_to=parent.effective_to,
+                    page_numbers=source.page_numbers,
+                    citations=source.citations,
+                    heading_path=source.heading_path,
+                    section_number=source.section_number,
+                    clause_number=source.clause_number,
+                    language_code=source.language_code,
+                    authoritative_language=source.authoritative_language,
+                    effective_from=source.effective_from,
+                    effective_to=source.effective_to,
                     score=score,
                 )
             )
+            selected_parent_ids.add(parent.chunk_id)
             used_tokens += token_count
             if len(selected) >= self._settings.final_context_max_chunks:
                 break
@@ -538,8 +521,6 @@ class HybridRagService:
         self,
         understanding: QueryUnderstanding,
         context: tuple[ContextEvidence, ...],
-        *,
-        use_extractive_fallback: bool,
     ) -> tuple[GeneratedDraft, bool]:
         try:
             primary = self._generator.generate(
@@ -552,23 +533,6 @@ class HybridRagService:
             primary = None
         if primary is not None and not primary.review_required:
             return primary, False
-        if primary is None and use_extractive_fallback:
-            return _extractive_evidence_draft(context), True
-        if (
-            self._settings.llm_allow_fallback
-            and understanding.difficult
-            and self._fallback_available()
-        ):
-            try:
-                fallback = self._generator.generate(
-                    understanding.normalized_query,
-                    context,
-                    response_language=understanding.response_language,
-                    model=self._settings.llm_fallback_model,
-                )
-                return fallback, True
-            except GenerationError:
-                pass
         if primary is not None:
             return primary, False
         return GeneratedDraft(
@@ -580,12 +544,6 @@ class HybridRagService:
             review_required=True,
             model=self._settings.llm_primary_model,
         ), False
-
-    def _fallback_available(self) -> bool:
-        try:
-            return self._settings.llm_fallback_model in self._generator.available_models()
-        except GenerationError:
-            return False
 
     def _deduplicate_translations(
         self,
@@ -660,38 +618,6 @@ class HybridRagService:
         return requested and bool(self._context.roles.intersection(_TRACE_ROLES))
 
 
-def _extractive_evidence_draft(
-    context: tuple[ContextEvidence, ...],
-) -> GeneratedDraft:
-    """Return one readable sentence copied only from the highest-ranked evidence.
-
-    This is intentionally opt-in at the caller. It is for a pre-registered demo
-    question when local generation is unavailable, not a general replacement for
-    grounded generation.
-    """
-
-    source = context[0]
-    text = " ".join((source.supporting_text or source.text).split())
-    sentences = tuple(
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", text)
-        if len(sentence.split()) >= 8
-    )
-    excerpt = sentences[0] if sentences else " ".join(text.split()[:48])
-    quote = " ".join(text.split()[:24])
-    if len(quote.split()) < 8:
-        raise GenerationError("extractive fallback evidence is too short")
-    return GeneratedDraft(
-        answer=f"Evidence-extracted: {excerpt} [{source.source_id}]",
-        cited_source_ids=(source.source_id,),
-        evidence_quotes={source.source_id: quote},
-        confidence="MEDIUM",
-        warnings=("EXTRACTIVE_EVIDENCE_FALLBACK", "LOCAL_GENERATION_UNAVAILABLE"),
-        review_required=False,
-        model="extractive-evidence-v1",
-    )
-
-
 def _source_citation(item: ContextEvidence) -> SourceCitation:
     return SourceCitation(
         source_id=item.source_id,
@@ -725,6 +651,31 @@ def _translation_preference(item: RankedEvidence) -> tuple[int, float]:
 
 def _candidate_score(item: RankedEvidence) -> float:
     return item.rerank_score if item.rerank_score is not None else item.rrf_score
+
+
+def _prioritize_definition_evidence(
+    lexical_query: str,
+    candidates: tuple[RankedEvidence, ...],
+) -> tuple[RankedEvidence, ...]:
+    """Keep an exact definition hit ahead of title/index matches.
+
+    The deterministic lexical rewrite emits ``<term> defined`` only for an explicit
+    definition question. In that narrow case, lexical rank is the stronger signal for
+    the substantive definition; the cross-encoder remains the tie-breaker.
+    """
+
+    if not lexical_query.casefold().endswith(" defined"):
+        return candidates
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                item.lexical_rank is None,
+                item.lexical_rank or 10**9,
+                -_candidate_score(item),
+            ),
+        )
+    )
 
 
 def _confidence(value: str) -> Literal["HIGH", "MEDIUM", "LOW"]:

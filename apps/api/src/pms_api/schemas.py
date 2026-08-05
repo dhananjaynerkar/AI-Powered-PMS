@@ -183,6 +183,29 @@ class HealthResponse(BaseModel):
     phase: str = "13"
 
 
+class RuntimeHealthResponse(HealthResponse):
+    runtime_id: str
+    process_id: int
+    server_started_at: datetime
+    api_port: int
+    environment: str
+    demo_mode: bool
+    generation_model: str
+    fallback_enabled: bool
+    version: str
+    configuration_fingerprint: str
+    model_state: str
+
+
+class RetrievalReadinessResponse(HealthResponse):
+    indexed_documents: int
+    accepted_parent_chunks: int
+    embedded_child_chunks: int
+    generation_model: str
+    generation_model_state: str
+    ready_for_questions: bool
+
+
 class MeResponse(BaseModel):
     subject: str
     roles: tuple[UserRole, ...]

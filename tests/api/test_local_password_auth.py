@@ -56,7 +56,7 @@ def test_local_auth_requires_complete_localhost_development_configuration() -> N
     with pytest.raises(ValidationError, match="LOCAL_PASSWORD_AUTH_ENABLED is allowed only"):
         Settings(app_env="production", pms_demo_mode=False, local_password_auth_enabled=True)
     with pytest.raises(ValidationError, match="local password authentication requires"):
-        Settings(local_password_auth_enabled=True)
+        Settings(_env_file=None, local_password_auth_enabled=True)
 
 
 def test_four_role_login_sets_http_only_cookie_and_builds_trusted_context(

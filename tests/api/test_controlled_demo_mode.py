@@ -15,8 +15,6 @@ from pms_api.app import create_app
 from pms_api.demo import (
     _INTENTS,
     DEMO_CONTEXT,
-    GOLD_COMBINED_QUESTION,
-    GOLD_POLICY_QUESTION,
     DemoIdentity,
     DemoQueryRequest,
     DemoRoute,
@@ -26,6 +24,7 @@ from pms_api.demo import (
 )
 from pms_api.semantic_demo import SemanticDemoResult, SemanticPlan
 from pms_common.settings import Settings
+from pms_retrieval.embedding import EmbeddingModelUnavailable
 from pms_retrieval.models import ChunkCitation, GroundedAnswer, SourceCitation
 from pydantic import SecretStr, ValidationError
 
@@ -60,16 +59,18 @@ class StubStructured:
 class StubRag:
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.verified_calls: list[dict[str, str]] = []
+        self.lexical_only_calls: list[bool] = []
 
     def ask(
         self,
         question: str,
         *,
         use_extractive_fallback: bool = False,
+        lexical_only: bool = False,
     ) -> GroundedAnswer:
         del use_extractive_fallback
         self.calls.append(question)
+        self.lexical_only_calls.append(lexical_only)
         return GroundedAnswer(
             answer="Grounded policy answer.",
             sources=(
@@ -89,28 +90,6 @@ class StubRag:
             confidence="HIGH",
             review_required=False,
         )
-
-    def answer_verified_extractive_evidence(
-        self,
-        query: str,
-        *,
-        document_id: str,
-        document_version_id: str,
-        parent_chunk_id: str,
-        child_chunk_id: str,
-    ) -> GroundedAnswer:
-        self.verified_calls.append(
-            {
-                "document_id": document_id,
-                "document_version_id": document_version_id,
-                "parent_chunk_id": parent_chunk_id,
-                "child_chunk_id": child_chunk_id,
-            }
-        )
-        return self.ask(query).model_copy(
-            update={"warnings": ("VERIFIED_EXTRACTIVE_DEMO_EVIDENCE",)}
-        )
-
 
 class StubSemantic:
     def __init__(self) -> None:
@@ -264,6 +243,90 @@ def test_document_and_sql_routes_remain_separate(monkeypatch: pytest.MonkeyPatch
     asyncio.run(scenario())
     assert structured.calls == []
     assert rag.calls == ["Explain the port land policy"]
+    assert rag.lexical_only_calls == [False]
+
+
+def test_rag_runtime_failure_returns_helpful_review_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _, _, _, audit = _app(monkeypatch, _enabled_settings())
+
+    @contextmanager
+    def unavailable_rag_provider(context: Any) -> Iterator[StubRag]:
+        assert context == DEMO_CONTEXT
+        raise EmbeddingModelUnavailable("private model path must not reach the browser")
+        yield StubRag()
+
+    app.state.rag_service_provider = unavailable_rag_provider
+
+    async def scenario() -> None:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await _select_demo_identity(client)
+            response = await client.post(
+                "/api/v1/demo/query",
+                json={"question": "Explain the indexed policy document"},
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["route"] == "DOCUMENT_RAG"
+        assert payload["review_required"] is True
+        assert payload["answer"]
+        assert "private model path" not in response.text
+        assert payload["warnings"] == ["NO_VERIFIED_EVIDENCE_RETURNED"]
+
+    asyncio.run(scenario())
+    assert audit.events[-1]["rejection_reason"] == "EmbeddingModelUnavailable"
+    assert audit.events[-1]["response_status"] == "REVIEW_REQUIRED"
+
+
+def test_postgres_rag_provider_reuses_process_model_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[str] = []
+
+    def resource(name: str) -> object:
+        created.append(name)
+        return object()
+
+    monkeypatch.setattr(
+        app_module,
+        "BgeM3EmbeddingAdapter",
+        lambda _settings: resource("embedder"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "BgeReranker",
+        lambda _settings: resource("reranker"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "OllamaGenerator",
+        lambda _settings: resource("generator"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "BgeM3Tokenizer",
+        lambda _settings: resource("tokenizer"),
+    )
+    provider = app_module.PostgresRagServiceProvider(object(), _enabled_settings())
+
+    first = provider._resources()
+    second = provider._resources()
+
+    assert second == first
+    assert created == ["embedder", "reranker", "generator", "tokenizer"]
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "What does the indexed document say about reduction in interest?",
+        "Summarize the indexed PDF about easement rights.",
+        "What do the SoR Rules say about land rates?",
+    ),
+)
+def test_document_words_route_to_rag(question: str) -> None:
+    assert route_demo_question(question) == (DemoRoute.DOCUMENT_RAG, None)
 
 
 @pytest.mark.parametrize(
@@ -277,10 +340,6 @@ def test_document_and_sql_routes_remain_separate(monkeypatch: pytest.MonkeyPatch
 )
 def test_write_and_unrestricted_table_requests_are_refused(question: str) -> None:
     assert route_demo_question(question) == (DemoRoute.REQUEST_REFUSED, None)
-
-
-def test_gold_combined_question_has_fixed_safe_routes() -> None:
-    assert route_demo_question(GOLD_COMBINED_QUESTION) == (DemoRoute.COMBINED, "approved_leases")
 
 
 def test_unsafe_demo_question_returns_review_required_and_is_audited(
@@ -336,31 +395,24 @@ def test_sensitive_personal_information_request_is_refused_before_services(
     assert audit.events[0]["response_status"] == "DENIED"
 
 
-def test_gold_question_uses_registered_retrieval_query_and_never_accepts_claims(
+def test_document_question_uses_the_real_retrieval_question_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, _, rag, _, _ = _app(monkeypatch, _enabled_settings())
+    question = "According to the indexed rules, what is an easement?"
 
     async def scenario() -> None:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             await _select_demo_identity(client)
             response = await client.post(
-                "/api/v1/demo/query", json={"question": GOLD_POLICY_QUESTION}
+                "/api/v1/demo/query", json={"question": question}
             )
         assert response.status_code == 200
         assert response.json()["route"] == "DOCUMENT_RAG"
-        assert response.json()["evidence_extracted"] is True
+        assert response.json()["evidence_extracted"] is False
 
     asyncio.run(scenario())
-    assert rag.calls == ["lease expired renewal clause existing lessee ROFR"]
-    assert rag.verified_calls == [
-        {
-            "document_id": "d6a611d8-5c2e-4617-b5ae-1eb824071ff7",
-            "document_version_id": "a62dfbef-fa4f-4260-88db-d59d22586be2",
-            "parent_chunk_id": "36887b628ce53ad5d95c7d2ae14a3e2dae2d1bed9d59c35497c28255a39fa6af",
-            "child_chunk_id": "ebe722cb480c5934ea7846794ccbf99f450195fbab35683f6de0fd70f137929e",
-        }
-    ]
+    assert rag.calls == [question]
 
 
 class _Result:

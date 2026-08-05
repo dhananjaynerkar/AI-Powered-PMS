@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from sqlalchemy import Engine, text
+
 from pms_common.security import AuthorizationContext, Classification, UserRole
 from pms_common.settings import Settings
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -42,7 +44,7 @@ class LocalAuthLoginRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    username: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._@-]+$")
+    username: str = Field(min_length=1, max_length=120, pattern=r"^[^\r\n\t]+$")
     password: SecretStr = Field(min_length=1, max_length=512)
     role: LocalLoginRole
 
@@ -124,6 +126,10 @@ class LocalAuthService:
         self._ttl_seconds = ttl_minutes * 60
         self._sessions: dict[bytes, _LocalSession] = {}
         self._lock = threading.Lock()
+
+    @classmethod
+    def from_database(cls, engine: Engine, *, ttl_minutes: int) -> DatabaseLocalAuthService:
+        return DatabaseLocalAuthService(engine, ttl_minutes=ttl_minutes)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> LocalAuthService:
@@ -222,3 +228,70 @@ def _secret_value(value: SecretStr | None) -> str:
 
 def _token_digest(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+class DatabaseLocalAuthService(LocalAuthService):
+    """Read-only localhost demo authentication backed by public.admin_users."""
+
+    def __init__(self, engine: Engine, *, ttl_minutes: int) -> None:
+        super().__init__((), ttl_minutes=ttl_minutes)
+        self._engine = engine
+
+    def login(self, request: LocalAuthLoginRequest) -> tuple[str, AuthorizationContext]:
+        role = _role_code(request.role)
+        with self._engine.connect() as connection:
+            user = connection.execute(
+                text("""
+                    SELECT admin_id, name, user_name, demo_password,
+                           account_status_code, division, department, designation, unit
+                    FROM public.admin_users
+                    WHERE user_name = :username
+                """),
+                {"username": request.username},
+            ).mappings().first()
+            if user is None or not _active_account(user["account_status_code"]):
+                raise LocalAuthenticationError("invalid local credentials")
+            stored = user["demo_password"]
+            if not isinstance(stored, str) or not stored:
+                raise LocalAuthenticationError("invalid local credentials")
+            if not hmac.compare_digest(request.password.get_secret_value(), stored):
+                raise LocalAuthenticationError("invalid local credentials")
+            role_row = connection.execute(
+                text("""
+                    SELECT ar.role_id
+                    FROM public.admin_roles ar
+                    JOIN public.m_roles r ON r.role_id = ar.role_id
+                    WHERE ar.admin_id = :admin_id AND ar.is_active = true
+                """),
+                {"admin_id": user["admin_id"]},
+            ).mappings().all()
+        resolved = {str(row["role_id"]).strip().upper() for row in role_row}
+        if role not in resolved:
+            raise LocalAuthenticationError("invalid local credentials")
+        context = AuthorizationContext(
+            subject=f"local.{user['user_name']}",
+            roles=frozenset({_role_to_user_role(role)}),
+            tenant_id=None,
+            department_id=str(user["department"]) if user["department"] is not None else None,
+            classification=Classification.INTERNAL,
+            unit_id=str(user["unit"]) if user["unit"] is not None else None,
+        )
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._purge_expired_locked()
+            self._sessions[_token_digest(token)] = _LocalSession(
+                context=context, expires_at=time.monotonic() + self._ttl_seconds
+            )
+        return token, context
+
+
+def _active_account(value: object) -> bool:
+    return str(value or "").strip().upper() in {"A", "ACTIVE", "1", "Y"}
+
+
+def _role_code(role: LocalLoginRole) -> str:
+    return {"Data Entry Operator": "DO", "Nodal/Regional Officer": "NO", "HOD": "HO", "Tenant": "TN"}[role]
+
+
+def _role_to_user_role(role: str) -> UserRole:
+    return {"DO": UserRole.DATA_ENTRY_OPERATOR, "NO": UserRole.NODAL_REGIONAL_OFFICER, "HO": UserRole.HOD, "TN": UserRole.TENANT}[role]

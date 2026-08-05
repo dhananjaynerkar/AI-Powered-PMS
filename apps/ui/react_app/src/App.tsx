@@ -1,25 +1,37 @@
-import { FormEvent, type ReactNode, useEffect, useState } from "react";
+import {
+  createContext,
+  FormEvent,
+  type MouseEvent,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useState
+} from "react";
 
 import {
   ApiError,
   createCase,
   endDemoSession,
+  endLocalSession,
   loadAudit,
   loadCaseQueue,
   loadDemoMe,
   loadDemoStatus,
+  loadDocument,
   loadLocalAuthStatus,
   loadMe,
   loadTimeline,
+  loadRetrievalReadiness,
   loginLocally,
-  logout,
   postCaseMessage,
-  runPolicyQuery,
   runDemoQuery,
+  runPolicyQuery,
   runStructuredQuery,
   startDemoSession,
   submitToHod,
   submitToNo,
+  uploadDocument,
   verifyCase
 } from "./api";
 import type {
@@ -28,216 +40,986 @@ import type {
   CaseTimeline,
   DemoAnswer,
   DemoIdentity,
+  DocumentMetadata,
+  DocumentUploadResult,
   GroundedAnswer,
   LocalLoginRole,
   Me,
+  RuntimeHealth,
+  RetrievalReadiness,
   StructuredAnswer
 } from "./types";
 import "./styles.css";
+import { loadRuntimeHealth } from "./api/client";
+
+type IconName =
+  | "anchor"
+  | "bar"
+  | "bell"
+  | "bot"
+  | "building"
+  | "calendar"
+  | "database"
+  | "file"
+  | "grid"
+  | "home"
+  | "help"
+  | "lock"
+  | "logout"
+  | "map"
+  | "message"
+  | "refresh"
+  | "rupee"
+  | "search"
+  | "send"
+  | "shield"
+  | "upload"
+  | "users";
+
+type PageState<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: T }
+  | { status: "empty" }
+  | { status: "error"; message: string }
+  | { status: "unauthorized"; message: string };
+
+interface RouterState {
+  pathname: string;
+  search: string;
+  navigate: (to: string, options?: { replace?: boolean }) => void;
+}
+
+const RouterContext = createContext<RouterState | null>(null);
+
+function useRouter(): RouterState {
+  const context = useContext(RouterContext);
+  if (context === null) throw new Error("router context is missing");
+  return context;
+}
+
+function BrowserRouter({ children }: { children: ReactNode }) {
+  const [location, setLocation] = useState(() => ({
+    pathname: window.location.pathname,
+    search: window.location.search
+  }));
+
+  useEffect(() => {
+    const update = () => setLocation({ pathname: window.location.pathname, search: window.location.search });
+    window.addEventListener("popstate", update);
+    return () => window.removeEventListener("popstate", update);
+  }, []);
+
+  function navigate(to: string, options: { replace?: boolean } = {}) {
+    const target = new URL(to, window.location.origin);
+    if (options.replace) window.history.replaceState({}, "", target);
+    else window.history.pushState({}, "", target);
+    setLocation({ pathname: target.pathname, search: target.search });
+  }
+
+  return <RouterContext.Provider value={{ ...location, navigate }}>{children}</RouterContext.Provider>;
+}
+
+function Link({
+  to,
+  children,
+  className,
+  title,
+  "aria-label": ariaLabel
+}: {
+  to: string;
+  children: ReactNode;
+  className?: string;
+  title?: string;
+  "aria-label"?: string;
+}) {
+  const { navigate } = useRouter();
+  function click(event: MouseEvent<HTMLAnchorElement>) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigate(to);
+  }
+  return <a aria-label={ariaLabel} className={className} href={to} onClick={click} title={title}>{children}</a>;
+}
+
+function matchRoute(pattern: string, pathname: string): Record<string, string> | null {
+  const patternParts = pattern.split("/").filter(Boolean);
+  const pathParts = pathname.split("/").filter(Boolean);
+  if (patternParts.length !== pathParts.length) return null;
+  const params: Record<string, string> = {};
+  for (let index = 0; index < patternParts.length; index += 1) {
+    const patternPart = patternParts[index];
+    const pathPart = pathParts[index];
+    if (patternPart.startsWith(":")) params[patternPart.slice(1)] = decodeURIComponent(pathPart);
+    else if (patternPart !== pathPart) return null;
+  }
+  return params;
+}
+
+const ALL_STAFF_ROLES = ["Data Entry Operator", "Nodal/Regional Officer", "HOD"] as const;
+const REVIEW_ROLES = ["Nodal/Regional Officer", "HOD"] as const;
+const HOD_ONLY = ["HOD"] as const;
+
+const NAV_ITEMS: Array<{
+  label: string;
+  path: string;
+  icon: IconName;
+  roles: readonly string[];
+}> = [
+  { label: "Home", path: "/", icon: "home", roles: ["Tenant", ...ALL_STAFF_ROLES] },
+  { label: "Dashboard", path: "/dashboard", icon: "grid", roles: ["Tenant", ...ALL_STAFF_ROLES] },
+  { label: "Tenants", path: "/tenants", icon: "users", roles: ALL_STAFF_ROLES },
+  { label: "Lease Management", path: "/leases", icon: "file", roles: ["Tenant", ...ALL_STAFF_ROLES] },
+  { label: "Land Monitoring", path: "/land", icon: "map", roles: ALL_STAFF_ROLES },
+  { label: "Policy Repository", path: "/policies", icon: "database", roles: ["Tenant", ...ALL_STAFF_ROLES] },
+  { label: "Document Upload", path: "/documents", icon: "upload", roles: ALL_STAFF_ROLES },
+  { label: "AI Assistant", path: "/assistant", icon: "bot", roles: ["Tenant", ...ALL_STAFF_ROLES] },
+  { label: "Analytics", path: "/analytics", icon: "bar", roles: ALL_STAFF_ROLES },
+  { label: "Audit Logs", path: "/audit", icon: "file", roles: REVIEW_ROLES },
+  { label: "Approval Queue", path: "/approvals", icon: "shield", roles: REVIEW_ROLES },
+  { label: "Forecasting", path: "/forecasting", icon: "bar", roles: HOD_ONLY },
+  { label: "Legal Cases", path: "/legal-cases", icon: "building", roles: REVIEW_ROLES }
+];
+
+const iconPaths: Record<IconName, ReactNode> = {
+  anchor: <><circle cx="12" cy="5" r="2" /><path d="M12 7v12" /><path d="M5 12H3c0 4.5 3.5 8 9 8s9-3.5 9-8h-2" /><path d="M8 12h8" /></>,
+  bar: <><path d="M4 20V10" /><path d="M10 20V4" /><path d="M16 20v-7" /><path d="M22 20H2" /></>,
+  bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
+  bot: <><rect x="4" y="8" width="16" height="12" rx="2" /><path d="M12 4v4" /><path d="M8 13h.01" /><path d="M16 13h.01" /><path d="M9 17h6" /></>,
+  building: <><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M9 21v-4h6v4" /><path d="M8 7h.01" /><path d="M12 7h.01" /><path d="M16 7h.01" /><path d="M8 11h.01" /><path d="M12 11h.01" /><path d="M16 11h.01" /></>,
+  calendar: <><rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4" /><path d="M8 2v4" /><path d="M3 10h18" /></>,
+  database: <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" /></>,
+  file: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M8 13h8" /><path d="M8 17h6" /></>,
+  grid: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /></>,
+  home: <><path d="m3 11 9-8 9 8" /><path d="M5 10v10h14V10" /><path d="M9 20v-6h6v6" /></>,
+  help: <><circle cx="12" cy="12" r="10" /><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2.2-3 4" /><path d="M12 17h.01" /></>,
+  lock: <><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>,
+  logout: <><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="M16 17l5-5-5-5" /><path d="M21 12H9" /></>,
+  map: <><path d="M9 18l-6 3V6l6-3 6 3 6-3v15l-6 3-6-3z" /><path d="M9 3v15" /><path d="M15 6v15" /></>,
+  message: <><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" /></>,
+  refresh: <><path d="M21 12a9 9 0 0 1-15.5 6.2" /><path d="M3 12A9 9 0 0 1 18.5 5.8" /><path d="M18 2v4h4" /><path d="M6 22v-4H2" /></>,
+  rupee: <><path d="M6 3h12" /><path d="M6 8h12" /><path d="M6 13h5a5 5 0 0 0 0-10" /><path d="M6 13l8 8" /></>,
+  search: <><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></>,
+  send: <><path d="M22 2L11 13" /><path d="M22 2l-7 20-4-9-9-4z" /></>,
+  shield: <><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /><path d="M9 12l2 2 4-4" /></>,
+  upload: <><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M17 8l-5-5-5 5" /><path d="M12 3v12" /></>,
+  users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></>
+};
+
+function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
+  return <svg aria-hidden className="icon" height={size} viewBox="0 0 24 24" width={size}>{iconPaths[name]}</svg>;
+}
 
 function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : "Request failed";
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === "string") return reason;
+  if (reason && typeof reason === "object") {
+    const detail = (reason as { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    try {
+      return JSON.stringify(reason);
+    } catch {
+      return "Request failed";
+    }
+  }
+  return "Request failed";
 }
 
 function isDenied(reason: unknown): boolean {
   return reason instanceof ApiError && reason.status === 403;
 }
 
-function isTenant(identity: Me | null): boolean {
-  return identity?.roles.includes("Tenant") ?? false;
+function hasAnyRole(me: Me, roles: readonly string[]): boolean {
+  return me.roles.some((role) => roles.includes(role));
 }
 
-function renderOperationalRow(row: Record<string, unknown>): string {
-  return Object.entries(row)
-    .filter(([column]) => column !== "source_refreshed_at")
-    .map(([column, value]) => `${column.replaceAll("_", " ")}: ${value === null ? "not recorded" : String(value)}`)
-    .join(" · ");
+function isTenant(me: Me): boolean {
+  return me.roles.includes("Tenant");
 }
 
-function StatusPill({ children, tone = "ready" }: { children: string; tone?: "ready" | "pending" }) {
+function StatusBadge({ children, tone = "ready" }: { children: string; tone?: "ready" | "pending" | "danger" | "neutral" }) {
   return <span className={`status-pill ${tone}`}>{children}</span>;
 }
 
 function AppBrand({ compact = false }: { compact?: boolean }) {
   return (
     <div className="app-brand">
-      <div className="brand-mark" aria-hidden>⚓</div>
+      <div className="brand-mark" aria-hidden><Icon name="anchor" size={18} /></div>
       <div>
-        <p className="brand-overline">Indian Port Estate Services</p>
-        <strong>{compact ? "AI Powered PMS" : "AI Powered Port Management System"}</strong>
+        <p className="brand-overline">Indian Port Authority</p>
+        <strong>AI Powered Port Management System</strong>
       </div>
     </div>
   );
 }
 
-type PublicPage = "home" | "policies" | "about" | "help" | "contact";
-
-function PublicFooter({ setPage }: { setPage: (page: PublicPage) => void }) {
-  return <footer className="public-footer"><div className="public-footer-grid"><section><strong>AI Powered Port Management System</strong><p>Local, evidence-led port estate services prototype.</p></section><section><strong>Explore</strong><button onClick={() => setPage("policies")} type="button">Policy evidence</button><button onClick={() => setPage("about")} type="button">About the platform</button><button onClick={() => setPage("help")} type="button">Help</button></section><section><strong>Safety</strong><p>Server-enforced access</p><p>Source citations</p><p>Audited activity</p></section><section><strong>Prototype status</strong><p>Local development only</p><p>Not an official government website</p></section></div><div className="public-footer-bottom">© {new Date().getFullYear()} AI Powered PMS · Local demonstration</div></footer>;
+function LoadingSkeleton({ label = "Loading data from the configured source." }: { label?: string }) {
+  return <div className="state-card loading-state" aria-live="polite"><span /><span /><span /><p>{label}</p></div>;
 }
 
-function LocalPasswordLogin({ startLocalLogin }: { startLocalLogin: (username: string, password: string, role: LocalLoginRole) => void }) {
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [role, setRole] = useState<LocalLoginRole>("Data Entry Operator");
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    if (username.trim() && password) startLocalLogin(username.trim(), password, role);
-  }
-  return <form className="local-login-form" onSubmit={submit}><label>Role<select value={role} onChange={(event) => setRole(event.target.value as LocalLoginRole)}><option>Data Entry Operator</option><option>Nodal/Regional Officer</option><option>HOD</option><option>Tenant</option></select></label><label>Username<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} /></label><label>Password<input autoComplete="current-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="gold-action" type="submit">Sign in securely <span>→</span></button><p className="demo-gate-note">Local development login only. The server verifies an scrypt password hash and sets an HttpOnly session cookie.</p></form>;
+function EmptyState({ title, text }: { title: string; text: string }) {
+  return <div className="state-card"><Icon name="file" /><h2>{title}</h2><p>{text}</p></div>;
 }
 
-function LoginScreen({ error, demoAvailable, localAuthAvailable, startDemo, startLocalLogin }: { error: string | null; demoAvailable: boolean; localAuthAvailable: boolean; startDemo: (identity: DemoIdentity) => void; startLocalLogin: (username: string, password: string, role: LocalLoginRole) => void }) {
-  const [page, setPage] = useState<PublicPage>("home");
-  const nav = <nav aria-label="Public portal navigation">{(["home", "policies", "about", "help", "contact"] as const).map((item) => <button className={page === item ? "active" : ""} key={item} onClick={() => setPage(item)} type="button">{item === "home" ? "Home" : item === "policies" ? "Policy evidence" : item[0].toUpperCase() + item.slice(1)}</button>)}</nav>;
-  const accessActions = localAuthAvailable ? <LocalPasswordLogin startLocalLogin={startLocalLogin} /> : demoAvailable ? <div className="portal-actions"><button className="gold-action" onClick={() => startDemo("demo.do")} type="button">Start as DO <span>→</span></button><button className="outline-action" onClick={() => startDemo("demo.no")} type="button">Review as NO</button><button className="outline-action" onClick={() => startDemo("demo.hod")} type="button">Review as HOD</button></div> : <p className="demo-gate-note">The controlled demo is unavailable. It requires the existing localhost development gate; live Keycloak login is intentionally not used for this client demonstration.</p>;
-  let content: ReactNode;
-  if (page === "policies") {
-    content = <section className="public-content policy-layout"><aside className="policy-list"><p className="eyebrow">Verified repository</p><h1>Policy evidence</h1><p>Only accepted and indexed documents are displayed.</p><button className="selected-policy" type="button"><strong>Clarification Circular (Land Management) No. 2 of 2019</strong><span>Accepted internal evidence · page 2</span></button><p className="muted">More documents appear only after acceptance and indexing.</p></aside><article className="policy-detail"><span className="policy-tag">Land management · accepted</span><h2>Clarification Circular (Land Management) No. 2 of 2019</h2><p>Verified evidence is available from <strong>Clarification 1</strong> on page 2. The controlled assistant returns this passage with its source citation; it does not determine an individual tenant’s eligibility or dues.</p><div className="policy-stat-grid"><div><span>Evidence page</span><strong>2</strong></div><div><span>Status</span><strong>Accepted</strong></div><div><span>Classification</span><strong>Internal</strong></div></div>{demoAvailable ? <button onClick={() => startDemo("demo.do")} type="button">Open controlled evidence demo</button> : <p className="demo-gate-note">Controlled evidence access is unavailable until the local demo gate is enabled.</p>}</article></section>;
-  } else if (page === "about") {
-    content = <section className="public-content about-content"><p className="eyebrow">About the platform</p><h1>Evidence-led port estate operations</h1><p className="lead">A local system for authorized document evidence, approved operational queries and traceable case collaboration.</p><div className="feature-grid"><article><span>◈</span><h2>Secure by design</h2><p>Identity, RBAC, RLS and document ACL checks occur before retrieval.</p></article><article><span>✦</span><h2>Grounded answers</h2><p>Document responses carry validated citations instead of unsupported claims.</p></article><article><span>▦</span><h2>Trusted operations</h2><p>Structured questions use approved, read-only query templates.</p></article><article><span>▤</span><h2>Shared continuity</h2><p>Case messages, handoffs and context capsules preserve workflow evidence.</p></article></div></section>;
-  } else if (page === "help") {
-    content = <section className="public-content narrow-content"><p className="eyebrow">Help and safeguards</p><h1>Before you use the assistant</h1><div className="faq-list"><details open><summary>How is access protected?</summary><p>The server validates the identity and applies role, classification, document ACL and database policy controls. The frontend is not the security boundary.</p></details><details><summary>What can the assistant answer?</summary><p>It can return authorized document evidence and approved operational queries. Insufficient evidence returns review required.</p></details><details><summary>Does it accept arbitrary SQL?</summary><p>No. Operational access is limited to approved, parameterized, read-only query templates.</p></details><details><summary>Is this a public production service?</summary><p>No. This interface is a local prototype and is not an official government website.</p></details></div></section>;
-  } else if (page === "contact") {
-    content = <section className="public-content contact-content"><div><p className="eyebrow">Project contact</p><h1>Request a controlled demonstration</h1><p className="lead">This local prototype does not send messages or collect personal contact information through the browser.</p><div className="contact-card"><strong>Safe next step</strong><p>Use the approved project communication channel to arrange a review. Do not place credentials or sensitive case information in a web form.</p></div></div><aside><span>⌁</span><h2>Local-only scope</h2><p>Authentication, retrieval, query and case routes remain on the configured local environment.</p></aside></section>;
-  } else {
-    content = <><section className="public-hero"><div><p className="hero-label">Port estate services · local prototype</p><h1>Intelligent evidence for port land and lease management.</h1><p>Bring authorized policy evidence, approved PostgreSQL facts and cross-role case continuity into one controlled workflow.</p>{accessActions}<p className="keycloak-parked">Live Keycloak sign-in is retained in the application but parked for this local client demonstration.</p></div><aside className="hero-evidence"><p>CONTROLLED DEMONSTRATION</p><h2>Ask with evidence, not assumptions.</h2><ul><li>Authorized policy retrieval with page citations</li><li>Approved read-only operational queries</li><li>Persistent DO → NO → HOD case context</li></ul><span>Local only · production approval required</span></aside></section><section className="public-section"><p className="eyebrow">Platform modules</p><h2>One controlled system for port estate work</h2><div className="feature-grid"><article><span>◉</span><h3>Evidence assistant</h3><p>Find accepted policy evidence with source and page references.</p></article><article><span>⌂</span><h3>Tenant access</h3><p>Tenant demonstration remains outside this controlled officer-only demo.</p></article><article><span>▦</span><h3>Authority workflow</h3><p>DO, NO and HOD work from a shared, auditable case timeline.</p></article><article><span>▤</span><h3>Approved data</h3><p>Structured answers come only from governed read-only views.</p></article></div></section><section className="trust-band"><div><p className="eyebrow">Security and architecture</p><h2>Traceable by design</h2><p>Authorization before retrieval, citations before answers, and audits for sensitive activity.</p></div><div className="trust-chips"><span>Controlled local demo</span><span>RBAC + RLS</span><span>PostgreSQL</span><span>pgvector</span><span>Hybrid retrieval</span><span>Audit trail</span></div></section><section className="public-cta"><div><p className="eyebrow">Client demonstration</p><h2>Open the controlled officer workflow</h2><p>Use the same case as DO, NO and HOD to show approved evidence and auditable role handoff.</p></div>{accessActions}</section></>;
-  }
-  return <main className="public-portal"><div className="public-topbar"><span>AI Powered PMS · Local on-premises prototype</span><span>Not an official Government of India website</span></div><header className="public-header"><AppBrand />{nav}</header>{error && <div className="public-alert" role="alert">{error}</div>}{content}{demoAvailable && !localAuthAvailable && page === "home" && <section className="demo-launch"><div><p className="eyebrow">Local controlled demo</p><strong>Server-issued officer identities only</strong><span>DO, NO and HOD are mapped by the local server. No Keycloak credential, browser role or tenant record is used.</span></div><div><button onClick={() => startDemo("demo.do")} type="button">Try as DO</button><button onClick={() => startDemo("demo.no")} type="button">Try as NO</button><button onClick={() => startDemo("demo.hod")} type="button">Try as HOD</button></div></section>}<PublicFooter setPage={setPage} /></main>;
+function ErrorState({ message }: { message: string }) {
+  return <div className="state-card error-state" role="alert"><Icon name="help" /><h2>Request failed</h2><p>{message}</p></div>;
 }
 
-function DemoWorkspace({ me, cases, timeline, question, answer, caseMessage, busy, error, setQuestion, setCaseMessage, submit, createDemoCase, selectCase, sendCaseMessage, handoffToNo, verifyByNo, forwardToHod, exit }: { me: Me; cases: CaseRecord[]; timeline: CaseTimeline | null; question: string; answer: DemoAnswer | null; caseMessage: string; busy: boolean; error: string | null; setQuestion: (value: string) => void; setCaseMessage: (value: string) => void; submit: (event: FormEvent) => void; createDemoCase: () => void; selectCase: (caseId: string) => void; sendCaseMessage: (event: FormEvent) => void; handoffToNo: () => void; verifyByNo: () => void; forwardToHod: () => void; exit: () => void }) {
-  const routeLabel = answer?.route.replaceAll("_", " ");
-  const isDo = me.roles.includes("Data Entry Operator");
-  const isNo = me.roles.includes("Nodal/Regional Officer");
-  const isHod = me.roles.includes("HOD");
+function PermissionDenied() {
+  return <div className="state-card denied-state" role="alert"><Icon name="lock" /><h1>403</h1><h2>Permission denied</h2><p>Your server-issued role is not authorized for this page.</p><Link to="/dashboard">Return to dashboard</Link></div>;
+}
+
+function SearchInput({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
   return (
-    <main className="workspace-shell demo-workspace">
-      <div className="demo-banner"><strong>LOCAL CONTROLLED DEMO</strong><span>Read-only sample access. Not approved for production use.</span></div>
-      <header className="workspace-header">
-        <AppBrand compact />
-        <div className="workspace-title"><h1>Case-to-evidence demo</h1><p>One persistent DO → NO → HOD case with governed PostgreSQL and document evidence</p></div>
-        <div className="identity-card"><span className="identity-initial">D</span><div><strong>{me.subject}</strong><span>{me.roles.join(", ")}</span></div><button className="sign-out" onClick={exit} type="button">Exit demo</button></div>
-      </header>
-      {busy && <div className="notice">Running the approved local route…</div>}
-      {error && <div className="denied" role="alert">{error}</div>}
-      <section className="demo-case-grid">
-        <aside className="content-card"><div className="card-heading"><div><p className="eyebrow">Persistent workflow</p><h2>Controlled case</h2></div><StatusPill>{`${cases.length} visible`}</StatusPill></div>{isDo && <button onClick={createDemoCase} type="button">Create or open demo case</button>}{cases.map((item) => <button className="case-card" key={item.case_id} onClick={() => selectCase(item.case_id)} type="button"><strong>{item.title}</strong><span>{item.state.replaceAll("_", " ")}</span><small>{item.case_id}</small></button>)}</aside>
-        <section className="content-card"><p className="eyebrow">Case state</p>{timeline ? <><h2>{timeline.case.title}</h2><p><strong>Case ID:</strong> {timeline.case.case_id}</p><p><strong>State:</strong> {timeline.case.state.replaceAll("_", " ")}</p><p><strong>Current owner:</strong> {timeline.case.current_owner_subject}</p><div className="demo-actions">{isDo && timeline.case.state === "draft" && <button onClick={handoffToNo} type="button">Forward to NO</button>}{isNo && timeline.case.state === "submitted_to_no" && <button onClick={verifyByNo} type="button">Record verification</button>}{isNo && timeline.case.state === "verified_by_no" && <button onClick={forwardToHod} type="button">Forward to HOD</button>}{isHod && timeline.case.state === "submitted_to_hod" && <StatusPill>Record final review below</StatusPill>}</div></> : <p className="empty-state">DO creates the safe fixture; all three roles then open the same server-authorized case.</p>}</section>
-        <aside className="content-card capsule-panel"><p className="eyebrow">Context capsule</p>{timeline?.capsules.at(-1) ? <><h2>{timeline.capsules.at(-1)?.objective}</h2><p>{timeline.capsules.at(-1)?.rolling_summary}</p><h3>Next action</h3><p>{timeline.capsules.at(-1)?.required_next_action}</p><h3>Evidence</h3><ul>{timeline.capsules.at(-1)?.evidence.map((item) => <li key={`${item.reference_type}-${item.reference_id}`}>{item.reference_type}: {item.reference_id}</li>)}</ul></> : <p className="empty-state">A bounded capsule is generated at each handoff.</p>}</aside>
-      </section>
-      <section className="content-card demo-chat">
-        <div className="card-heading"><div><p className="eyebrow">Controlled question routing</p><h2>Ask about policy or approved operational data</h2></div><StatusPill>Read only</StatusPill></div>
-        <form onSubmit={submit}><textarea aria-label="Demo question" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Try: Show five approved lease summaries. Or use the gold policy question from the runbook." rows={4} /><button type="submit">Ask controlled demo</button></form>
-        {answer && <div className="answer-box demo-answer"><div className="answer-meta"><StatusPill tone={answer.review_required ? "pending" : "ready"}>{routeLabel ?? "REVIEW REQUIRED"}</StatusPill><span>{answer.duration_ms.toFixed(1)} ms · Correlation {answer.correlation_id}</span></div><p>{answer.answer}</p>{answer.structured && <section><h3>Operational facts from PostgreSQL</h3><p><strong>{answer.structured.query_id}</strong> · {answer.structured.database_objects.join(", ")} · {answer.structured.row_count} matching rows · {answer.structured.read_only ? "read-only" : "not available"}</p><p>{answer.structured.filters.join(" ")}{answer.structured.freshness_at ? ` Source refreshed ${new Date(answer.structured.freshness_at).toLocaleString()}.` : ""}</p>{answer.structured.rows.length > 0 && <ol className="structured-result-lines">{answer.structured.rows.map((row, index) => <li key={index}>{renderOperationalRow(row)}</li>)}</ol>}</section>}{answer.document && <section><h3>Policy evidence from indexed document</h3>{answer.evidence_extracted && <p className="demo-warning">Verified extractive demonstration evidence; no model interpretation was added.</p>}<ul>{answer.document.sources.map((source) => <li key={source.source_id}><strong>{source.document_title}</strong><span>Pages {source.page_numbers.join(", ")}{source.clause_number ? ` · Clause ${source.clause_number}` : ""} · version {source.document_version_id}</span></li>)}</ul></section>}{answer.warnings.map((warning) => <p className="demo-warning" key={warning}>{warning}</p>)}</div>}
-      </section>
-      {timeline && <section className="content-card demo-timeline"><div className="card-heading"><div><p className="eyebrow">Chronology and observations</p><h2>Same persistent case</h2></div><StatusPill>{`${timeline.messages.length} messages`}</StatusPill></div><div className="message-list">{timeline.messages.map((message) => <article key={message.message_id}><div><strong>#{message.sequence_number} · {message.author_role}</strong><time>{new Date(message.created_at).toLocaleString()}</time></div><p>{message.body}</p></article>)}</div><form className="message-form" onSubmit={sendCaseMessage}><input aria-label="Case observation" value={caseMessage} onChange={(event) => setCaseMessage(event.target.value)} placeholder={isHod ? "Record final demo review status" : "Record an authorized observation"} /><button type="submit">Record observation</button></form></section>}
-    </main>
+    <label className="search-input">
+      <span>{label}</span>
+      <div><Icon name="search" size={17} /><input value={value} onChange={(event) => onChange(event.target.value)} placeholder={label} /></div>
+    </label>
   );
 }
 
-interface WorkspaceProps {
-  me: Me;
-  cases: CaseRecord[];
-  timeline: CaseTimeline | null;
-  audit: AuditEvent[];
-  policyQuestion: string;
-  policyAnswer: GroundedAnswer | null;
-  structuredQuestion: string;
-  structuredAnswer: StructuredAnswer | null;
-  messageBody: string;
-  busy: boolean;
-  error: string | null;
-  denial: string | null;
-  setPolicyQuestion: (value: string) => void;
-  setStructuredQuestion: (value: string) => void;
-  setMessageBody: (value: string) => void;
-  selectCase: (caseId: string) => void;
-  submitPolicy: (event: FormEvent) => void;
-  submitStructured: (event: FormEvent) => void;
-  sendMessage: (event: FormEvent) => void;
+function FilterBar({ children }: { children: ReactNode }) {
+  return <section className="filter-bar" aria-label="Page filters">{children}</section>;
 }
 
-function WorkspaceHeader({ me, title, subtitle }: Pick<WorkspaceProps, "me"> & { title: string; subtitle: string }) {
+function PageHeader({ title, subtitle, children }: { title: string; subtitle: string; children?: ReactNode }) {
+  const { pathname } = useRouter();
+  const segments = pathname.split("/").filter(Boolean);
   return (
-    <header className="workspace-header">
-      <AppBrand compact />
-      <div className="workspace-title"><h1>{title}</h1><p>{subtitle}</p></div>
-      <div className="identity-card">
-        <span className="identity-initial">{me.subject.slice(0, 1).toUpperCase()}</span>
-        <div><strong>{me.subject}</strong><span>{me.roles.join(", ")}</span></div>
-        <button className="sign-out" onClick={logout} type="button">Sign out</button>
+    <header className="page-header">
+      <nav aria-label="Breadcrumbs" className="breadcrumbs">
+        <Link to="/dashboard">Dashboard</Link>
+        {segments.map((segment, index) => {
+          const path = `/${segments.slice(0, index + 1).join("/")}`;
+          return <Link key={path} to={path}>{segment.replaceAll("-", " ")}</Link>;
+        })}
+      </nav>
+      <div className="page-title-row">
+        <div><h1>{title}</h1><p>{subtitle}</p></div>
+        {children}
       </div>
     </header>
   );
 }
 
-function EvidencePanel({
-  policyQuestion,
-  policyAnswer,
-  setPolicyQuestion,
-  submitPolicy
-}: Pick<WorkspaceProps, "policyQuestion" | "policyAnswer" | "setPolicyQuestion" | "submitPolicy">) {
+function DataTable({
+  columns,
+  rows,
+  getRowPath
+}: {
+  columns: Array<{ key: string; label: string }>;
+  rows: Array<Record<string, ReactNode>>;
+  getRowPath?: (row: Record<string, ReactNode>) => string;
+}) {
+  if (rows.length === 0) return <EmptyState title="No records found" text="Data not available from the configured source." />;
   return (
-    <section className="content-card evidence-panel">
-      <div className="card-heading"><div><p className="eyebrow">Evidence search</p><h2>Authorized policy question</h2></div><StatusPill>Server retrieval</StatusPill></div>
-      <form onSubmit={submitPolicy}>
-        <textarea aria-label="Policy question" value={policyQuestion} onChange={(event) => setPolicyQuestion(event.target.value)} placeholder="Ask about an authorized policy or clause" rows={3} />
-        <button type="submit">Retrieve cited evidence</button>
+    <div className="table-wrap">
+      <table>
+        <thead><tr>{columns.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={index}>
+              {columns.map((column) => <td key={column.key}>{getRowPath && column.key === columns[0].key ? <Link to={getRowPath(row)}>{row[column.key]}</Link> : row[column.key]}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ConfirmDialog({
+  title,
+  text,
+  confirmLabel,
+  onCancel,
+  onConfirm
+}: {
+  title: string;
+  text: string;
+  confirmLabel: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="dialog-backdrop" role="presentation">
+      <section aria-modal="true" className="confirm-dialog" role="dialog">
+        <h2>{title}</h2>
+        <p>{text}</p>
+        <div><button className="secondary-action" onClick={onCancel} type="button">Cancel</button><button onClick={onConfirm} type="button">{confirmLabel}</button></div>
+      </section>
+    </div>
+  );
+}
+
+function PublicLogin({
+  error,
+  demoAvailable,
+  localAuthAvailable,
+  startDemo,
+  startLocalLogin
+}: {
+  error: string | null;
+  demoAvailable: boolean;
+  localAuthAvailable: boolean;
+  startDemo: (identity: DemoIdentity) => void;
+  startLocalLogin: (username: string, password: string, role: LocalLoginRole) => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<LocalLoginRole>("Data Entry Operator");
+  const { navigate } = useRouter();
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!username.trim() || !password) return;
+    startLocalLogin(username.trim(), password, role);
+  }
+
+  return (
+    <main className="public-portal">
+      <div className="public-topbar"><span>भारत सरकार | Government of India</span><span>Ministry of Ports, Shipping & Waterways</span><span className="language-pill">English</span></div>
+      <header className="public-header"><AppBrand /><nav aria-label="Public navigation"><button className="active" type="button">Home</button><button type="button">Policies</button><button type="button">Help</button></nav></header>
+      <section className="public-hero">
+        <div>
+          <p className="hero-label">Local enterprise prototype</p>
+          <h1>AI Powered Port Management System</h1>
+          <p>Role-aware estate workflow, governed PostgreSQL access, document evidence, and audit-ready collaboration for port land administration.</p>
+          {demoAvailable && (
+            <div className="portal-actions">
+              <button className="gold-action" onClick={() => { startDemo("demo.do"); navigate("/assistant"); }} type="button">Try as Data Entry Operator</button>
+              <button className="outline-action" onClick={() => { startDemo("demo.no"); navigate("/approvals"); }} type="button">Try as Nodal Officer</button>
+              <button className="outline-action" onClick={() => { startDemo("demo.hod"); navigate("/dashboard"); }} type="button">Try as HOD</button>
+            </div>
+          )}
+          {error && <div className="public-alert" role="alert">{error}</div>}
+        </div>
+      </section>
+      <section className="portal-login staff">
+        <div className="login-card">
+          <div className="login-heading"><span className="square-icon"><Icon name="lock" /></span><div><h1>Secure Login</h1><p>Use the configured local account for Tenant, Data Entry Operator, Nodal/Regional Officer or HOD.</p></div></div>
+          <form className="login-form" onSubmit={submit}>
+            <label>Role<select value={role} onChange={(event) => setRole(event.target.value as LocalLoginRole)}><option>Data Entry Operator</option><option>Nodal/Regional Officer</option><option>HOD</option><option>Tenant</option></select></label>
+            <label>Username<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+            <label>Password<input autoComplete="current-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <button className="primary-action" disabled={!localAuthAvailable} type="submit"><Icon name="lock" size={17} /> Sign in</button>
+          </form>
+          {!localAuthAvailable && <p className="login-note">Local password authentication is not enabled in the configured backend.</p>}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function Sidebar({
+  me,
+  demoActive,
+  exitDemo,
+  returnHome
+}: {
+  me: Me;
+  demoActive: boolean;
+  exitDemo: () => void;
+  returnHome: () => void;
+}) {
+  const { pathname } = useRouter();
+  const visibleItems = NAV_ITEMS.filter((item) => hasAnyRole(me, item.roles));
+  return (
+    <aside className="app-sidebar">
+      <AppBrand compact />
+      <nav aria-label="Application navigation">
+        {visibleItems.map((item) => (
+          item.path === "/"
+            ? (
+              <button aria-label={item.label} key={item.path} onClick={returnHome} title={item.label} type="button">
+                <Icon name={item.icon} size={18} />
+                <span>{item.label}</span>
+              </button>
+            )
+            : (
+              <Link aria-label={item.label} className={pathname.startsWith(item.path) ? "active" : ""} key={item.path} title={item.label} to={item.path}>
+                <Icon name={item.icon} size={18} />
+                <span>{item.label}</span>
+              </Link>
+            )
+        ))}
+      </nav>
+      <button className="sidebar-logout" onClick={demoActive ? exitDemo : returnHome} type="button"><Icon name="logout" size={18} /> Logout</button>
+    </aside>
+  );
+}
+
+function TopBar({ me, demoActive }: { me: Me; demoActive: boolean }) {
+  const initials = me.subject.split(".").map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "U";
+  return (
+    <header className="app-topbar">
+      <AppBrand compact />
+      <div className="topbar-actions">
+        {demoActive && <StatusBadge tone="pending">Controlled local demo</StatusBadge>}
+        <StatusBadge>Secure session</StatusBadge>
+        <button className="icon-button" aria-label="Notifications" type="button"><Icon name="bell" size={19} /></button>
+        <span className="avatar">{initials}</span>
+        <div className="user-block"><strong>{me.subject}</strong><span>{me.roles.join(", ")}</span></div>
+      </div>
+    </header>
+  );
+}
+
+function AppShell({
+  me,
+  demoActive,
+  exitDemo,
+  returnHome,
+  children
+}: {
+  me: Me;
+  demoActive: boolean;
+  exitDemo: () => void;
+  returnHome: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <main className="dashboard-shell">
+      <Sidebar me={me} demoActive={demoActive} exitDemo={exitDemo} returnHome={returnHome} />
+      <section className="dashboard-main">
+        <TopBar me={me} demoActive={demoActive} />
+        {children}
+      </section>
+    </main>
+  );
+}
+
+function ProtectedRoute({ me, allowed, children }: { me: Me; allowed: readonly string[]; children: ReactNode }) {
+  if (!hasAnyRole(me, allowed)) return <PermissionDenied />;
+  return <>{children}</>;
+}
+
+function DashboardPage({ me, cases, audit, demoActive }: { me: Me; cases: CaseRecord[]; audit: AuditEvent[]; demoActive: boolean }) {
+  const role = me.roles[0] ?? "User";
+  const draftCases = cases.filter((item) => item.state === "draft").length;
+  const returnedCases = cases.filter((item) => item.state.includes("returned")).length;
+  const pendingCases = cases.filter((item) => item.state.includes("submitted")).length;
+  return (
+    <>
+      <PageHeader title={`${role} Dashboard`} subtitle="Server-authorized estate workflow overview">
+        {demoActive && <StatusBadge tone="pending">Demo data boundary visible</StatusBadge>}
+      </PageHeader>
+      <section className="metric-row">
+        <StatCard icon="message" label="Assigned cases" value={String(cases.length)} source="GET /api/v1/cases" />
+        <StatCard icon="file" label="Draft cases" value={String(draftCases)} source="Derived from authorized cases" />
+        <StatCard icon="refresh" label="Returned for correction" value={String(returnedCases)} source="Derived from authorized cases" />
+        <StatCard icon="shield" label="Pending submission/review" value={String(pendingCases)} source="Derived from authorized cases" />
+      </section>
+      <section className="dashboard-grid">
+        <Panel title="My Work Queue" icon="message"><CaseTable cases={cases.slice(0, 8)} /></Panel>
+        <Panel title="Document Processing Status" icon="upload"><Unavailable capability="Document ingestion rollup endpoint" /></Panel>
+        <Panel title="Authorized Estate/Plot Summary" icon="map"><Unavailable capability="Estate aggregation endpoint" /></Panel>
+        <Panel title="Recent Assistant Activity" icon="bot"><AuditList audit={audit.slice(0, 5)} /></Panel>
+      </section>
+    </>
+  );
+}
+
+function StatCard({ label, value, source, icon }: { label: string; value: string; source: string; icon: IconName }) {
+  return <article className="metric-card"><div><p>{label}</p><strong>{value}</strong><span>{source}</span></div><span><Icon name={icon} /></span></article>;
+}
+
+function Panel({ title, icon, children }: { title: string; icon: IconName; children: ReactNode }) {
+  return <section className="panel"><div className="panel-title"><span><Icon name={icon} /></span><div><h2>{title}</h2><p>Server data only. Missing sources are explicitly marked.</p></div></div>{children}</section>;
+}
+
+function Unavailable({ capability }: { capability: string }) {
+  return <EmptyState title="Data not available from the configured source." text={`${capability} is not exposed by the current backend API.`} />;
+}
+
+function CaseTable({ cases }: { cases: CaseRecord[] }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "title", label: "Case" },
+        { key: "state", label: "State" },
+        { key: "owner", label: "Owner" },
+        { key: "updated", label: "Updated" }
+      ]}
+      rows={cases.map((item) => ({
+        title: item.title,
+        state: item.state.replaceAll("_", " "),
+        owner: item.current_owner_role,
+        updated: new Date(item.updated_at).toLocaleString(),
+        id: item.case_id
+      }))}
+      getRowPath={(row) => `/assistant/cases/${String(row.id)}`}
+    />
+  );
+}
+
+function AuditList({ audit }: { audit: AuditEvent[] }) {
+  if (audit.length === 0) return <EmptyState title="No visible audit events" text="No audit rows were returned for this role." />;
+  return <ul className="audit-list">{audit.map((item) => <li key={item.event_id}><strong>{item.result_status}</strong><span>{item.query_category}</span><small>{new Date(item.occurred_at).toLocaleString()} - {item.correlation_id}</small></li>)}</ul>;
+}
+
+function RegistryPage({ module }: { module: "tenants" | "leases" | "land" }) {
+  const { pathname, search: routeSearch, navigate } = useRouter();
+  const params = useMemo(() => new URLSearchParams(routeSearch), [routeSearch]);
+  const search = params.get("search") ?? "";
+  const status = params.get("status") ?? "all";
+  const titles = {
+    tenants: ["Tenant Registry", "Tenant list requires an approved tenant registry endpoint before records can be displayed."],
+    leases: ["Lease Management", "Lease data can be queried through approved structured routes; list/detail APIs are not yet exposed."],
+    land: ["Land Monitoring", "Plot and estate records need a governed plot-register endpoint or semantic view."],
+  } as const;
+  function update(key: string, value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    navigate(`${pathname}?${next.toString()}`);
+  }
+  return (
+    <>
+      <PageHeader title={titles[module][0]} subtitle={titles[module][1]} />
+      <FilterBar>
+        <SearchInput label={`Search ${module}`} value={search} onChange={(value) => update("search", value)} />
+        <label>Status<select value={status} onChange={(event) => update("status", event.target.value)}><option value="all">All statuses</option><option value="active">Active</option><option value="expired">Expired</option><option value="review">Review required</option></select></label>
+      </FilterBar>
+      <Panel title={titles[module][0]} icon={module === "land" ? "map" : module === "tenants" ? "users" : "file"}>
+        <Unavailable capability={`${titles[module][0]} list endpoint`} />
+      </Panel>
+      {module !== "tenants" && <StructuredWorkbench defaultQuestion={module === "land" ? "List available estates in the approved extract." : "Show five approved lease summaries."} />}
+    </>
+  );
+}
+
+function DetailPage({ kind, id }: { kind: "tenant" | "lease" | "plot" | "legal"; id: string }) {
+  return (
+    <>
+      <PageHeader title={`${kind[0].toUpperCase()}${kind.slice(1)} Detail`} subtitle={`Requested record: ${id}`} />
+      <Panel title="Record detail" icon="file">
+        <Unavailable capability={`${kind} detail endpoint for ${id}`} />
+      </Panel>
+    </>
+  );
+}
+
+function StructuredWorkbench({ defaultQuestion }: { defaultQuestion: string }) {
+  const [question, setQuestion] = useState(defaultQuestion);
+  const [state, setState] = useState<PageState<StructuredAnswer>>({ status: "idle" });
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!question.trim()) return;
+    setState({ status: "loading" });
+    try {
+      const answer = await runStructuredQuery(question.trim(), "");
+      setState(answer.records.length === 0 ? { status: "empty" } : { status: "success", data: answer });
+    } catch (reason) {
+      setState(isDenied(reason) ? { status: "unauthorized", message: "Server denied the structured query." } : { status: "error", message: errorMessage(reason) });
+    }
+  }
+  return (
+    <Panel title="Approved Structured Query" icon="database">
+      <form className="chat-form" onSubmit={submit}>
+        <textarea aria-label="Structured question" value={question} onChange={(event) => setQuestion(event.target.value)} rows={2} />
+        <button type="submit"><Icon name="send" size={18} /> Run</button>
       </form>
-      {policyAnswer && <div className="answer-box"><p>{policyAnswer.answer}</p><div className="answer-meta"><StatusPill tone={policyAnswer.review_required ? "pending" : "ready"}>{policyAnswer.review_required ? "Review required" : "Grounded"}</StatusPill><span>{policyAnswer.confidence}</span></div><ul>{policyAnswer.sources.map((source) => <li key={source.source_id}><strong>{source.document_title}</strong><span>Pages {source.page_numbers.join(", ")}{source.clause_number ? ` · Clause ${source.clause_number}` : ""}</span></li>)}</ul></div>}
+      <AsyncState state={state} render={(answer) => <AnswerRecords answer={answer} />} />
+    </Panel>
+  );
+}
+
+function AsyncState<T>({ state, render }: { state: PageState<T>; render: (data: T) => ReactNode }) {
+  if (state.status === "idle") return null;
+  if (state.status === "loading") return <LoadingSkeleton />;
+  if (state.status === "empty") return <EmptyState title="No matching records" text="The configured source returned no rows." />;
+  if (state.status === "error") return <ErrorState message={state.message} />;
+  if (state.status === "unauthorized") return <PermissionDenied />;
+  return <>{render(state.data)}</>;
+}
+
+function AnswerRecords({ answer }: { answer: StructuredAnswer }) {
+  return (
+    <section className="answer-panel">
+      <p>{answer.answer}</p>
+      <DataTable
+        columns={[
+          { key: "facts", label: "Facts" },
+          { key: "source", label: "Source" },
+          { key: "freshness", label: "Freshness" }
+        ]}
+        rows={answer.records.map((record) => ({
+          facts: Object.entries(record.values).map(([key, value]) => `${key.replaceAll("_", " ")}: ${value ?? "not recorded"}`).join("; "),
+          source: `${record.provenance.source_schema}.${record.provenance.source_table}`,
+          freshness: record.provenance.freshness_at ? new Date(record.provenance.freshness_at).toLocaleString() : "not recorded"
+        }))}
+      />
     </section>
   );
 }
 
-function TenantWorkspace(props: WorkspaceProps) {
-  const { me } = props;
+function PolicyPage() {
+  const [question, setQuestion] = useState("Explain an applicable land-management provision.");
+  const [answer, setAnswer] = useState<PageState<GroundedAnswer>>({ status: "idle" });
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!question.trim()) return;
+    setAnswer({ status: "loading" });
+    try {
+      const result = await runPolicyQuery(question.trim(), "");
+      setAnswer(result.sources.length === 0 && result.review_required ? { status: "empty" } : { status: "success", data: result });
+    } catch (reason) {
+      setAnswer(isDenied(reason) ? { status: "unauthorized", message: "Server denied policy retrieval." } : { status: "error", message: errorMessage(reason) });
+    }
+  }
   return (
-    <main className="workspace-shell">
-      <WorkspaceHeader me={me} title="Tenant workspace" subtitle="Your signed tenant scope and authorized evidence" />
-      <section className="tenant-banner"><div><p className="eyebrow">Tenant access</p><h2>Welcome to your protected service area</h2><p>Lease, payment, and document records are shown only after the backend verifies your canonical tenant mapping.</p></div><StatusPill>Signed tenant scope</StatusPill></section>
-      <section className="summary-grid tenant-summary">
-        <article className="summary-card"><p>Canonical tenant scope</p><strong>{me.tenant_id ?? "Not supplied"}</strong><span>This value comes from the signed token, not the browser.</span></article>
-        <article className="summary-card"><p>Lease and payment records</p><strong>Not connected</strong><span>No approved tenant lease/payment API exists yet; no values are displayed.</span></article>
-        <article className="summary-card"><p>Document access</p><strong>ACL controlled</strong><span>Use evidence search below; document ACL and classification are enforced by the server.</span></article>
-      </section>
-      <section className="tenant-grid"><EvidencePanel {...props} /><aside className="content-card next-card"><p className="eyebrow">Next verified step</p><h2>Tenant data view</h2><p>Before lease, bill, or payment cards can appear, add an approved API view and activate a canonical tenant mapping.</p><ul><li>No client-provided tenant ID is trusted.</li><li>No sample payments or lease amounts are shown.</li><li>Unauthorized evidence returns a server denial.</li></ul></aside></section>
-    </main>
+    <>
+      <PageHeader title="Policy Repository" subtitle="Governed document retrieval with page-level citation when available." />
+      <FilterBar>
+        <SearchInput label="Search policies" value={question} onChange={setQuestion} />
+        <label>Category<select><option>All approved categories</option><option>Acts</option><option>Rules</option><option>Land-management policy</option><option>Circulars</option></select></label>
+        <label>Language<select><option>All languages</option><option>English</option><option>Hindi</option><option>Marathi</option></select></label>
+      </FilterBar>
+      <Panel title="Policy AI Retrieval" icon="bot">
+        <form className="chat-form" onSubmit={submit}><textarea aria-label="Policy question" value={question} onChange={(event) => setQuestion(event.target.value)} rows={2} /><button type="submit"><Icon name="send" size={18} /> Retrieve</button></form>
+        <AsyncState state={answer} render={(result) => <EvidencePanel answer={result} />} />
+      </Panel>
+    </>
   );
 }
 
-function StaffWorkspace(props: WorkspaceProps) {
-  const { me, cases, timeline, audit, structuredAnswer, structuredQuestion, messageBody, busy, error, denial } = props;
+function PolicyDetailPage({ documentId }: { documentId: string }) {
   return (
-    <main className="workspace-shell">
-      <WorkspaceHeader me={me} title="Staff workspace" subtitle="Governed case collaboration, evidence, and approved operational queries" />
-      {busy && <div className="notice">Working with authorized PMS services…</div>}
-      {error && <div className="notice">{error}</div>}
-      {denial && <div className="denied" role="alert">{denial}</div>}
-      <section className="summary-grid"><article className="summary-card"><p>Authorized case queue</p><strong>{cases.length}</strong><span>Live count returned by the case service.</span></article><article className="summary-card"><p>Role and clearance</p><strong>{me.roles.join(" / ")}</strong><span>{me.classification} classification · {me.department_id ?? "no department"}</span></article><article className="summary-card"><p>Audit visibility</p><strong>{audit.length}</strong><span>Visible audit events for this signed role.</span></article></section>
-      <section className="staff-grid">
-        <aside className="content-card queue-panel"><div className="card-heading"><div><p className="eyebrow">Workflow</p><h2>Case queue</h2></div><StatusPill>Authorized</StatusPill></div>{cases.length === 0 ? <p className="empty-state">No authorized cases were returned.</p> : cases.map((item) => <button className="case-card" key={item.case_id} onClick={() => props.selectCase(item.case_id)} type="button"><strong>{item.title}</strong><span>{item.state.replaceAll("_", " ")}</span><small>{item.current_owner_role}</small></button>)}</aside>
-        <section className="content-card timeline-panel" aria-live="polite"><div className="card-heading"><div><p className="eyebrow">Shared case chat</p><h2>{timeline?.case.title ?? "Select an authorized case"}</h2></div>{timeline && <StatusPill>{timeline.case.state.replaceAll("_", " ")}</StatusPill>}</div>{timeline ? <><div className="message-list">{timeline.messages.map((message) => <article key={message.message_id}><div><strong>#{message.sequence_number} · {message.author_role}</strong><time>{new Date(message.created_at).toLocaleString()}</time></div><p>{message.body}</p></article>)}</div><form className="message-form" onSubmit={props.sendMessage}><input aria-label="Case message" value={messageBody} onChange={(event) => props.setMessageBody(event.target.value)} placeholder="Add an authorized case message" /><button type="submit">Send</button></form></> : <p className="empty-state">Select a case to view its server-authorized timeline and context.</p>}</section>
-        <aside className="content-card capsule-panel"><p className="eyebrow">Context capsule</p>{timeline?.capsules.at(-1) ? <><h2>{timeline.capsules.at(-1)?.objective}</h2><p>{timeline.capsules.at(-1)?.rolling_summary}</p><h3>Required next action</h3><p>{timeline.capsules.at(-1)?.required_next_action}</p><h3>Evidence references</h3><ul>{timeline.capsules.at(-1)?.evidence.map((item) => <li key={`${item.reference_type}-${item.reference_id}`}>{item.reference_type}: {item.reference_id}</li>)}</ul></> : <p className="empty-state">A context capsule appears after the first authorized handoff.</p>}</aside>
-      </section>
-      <section className="query-grid"><EvidencePanel {...props} /><section className="content-card structured-panel"><div className="card-heading"><div><p className="eyebrow">Exact facts</p><h2>Governed structured query</h2></div><StatusPill>Template-only</StatusPill></div><form onSubmit={props.submitStructured}><textarea aria-label="Structured question" value={structuredQuestion} onChange={(event) => props.setStructuredQuestion(event.target.value)} placeholder="Ask for an approved operational fact" rows={3} /><button type="submit">Run authorized query</button></form>{structuredAnswer && <div className="answer-box"><p>{structuredAnswer.answer}</p><pre>{JSON.stringify(structuredAnswer.records, null, 2)}</pre></div>}</section><aside className="content-card audit-panel"><p className="eyebrow">Audit</p><h2>Visible activity</h2>{audit.length === 0 ? <p className="empty-state">No visible audit rows for this role.</p> : <ul>{audit.map((event) => <li key={event.event_id}><strong>{event.result_status}</strong><span>{event.query_category}</span><small>{new Date(event.occurred_at).toLocaleString()}</small></li>)}</ul>}</aside></section>
-    </main>
+    <>
+      <PageHeader title="Policy Detail" subtitle={`Document ID: ${documentId}`} />
+      <DocumentDetail documentId={documentId} />
+    </>
   );
 }
 
-export default function App() {
+function EvidencePanel({ answer }: { answer: GroundedAnswer }) {
+  return (
+    <section className="evidence-panel">
+      <p>{answer.answer}</p>
+      <div className="answer-meta"><StatusBadge tone={answer.review_required ? "pending" : "ready"}>{answer.review_required ? "Review required" : "Grounded"}</StatusBadge><span>{answer.confidence}</span></div>
+      <DataTable
+        columns={[
+          { key: "document", label: "Document" },
+          { key: "version", label: "Version" },
+          { key: "pages", label: "Pages" },
+          { key: "clause", label: "Clause" }
+        ]}
+        rows={answer.sources.map((source) => ({
+          document: source.document_title,
+          version: source.document_version_id,
+          pages: source.page_numbers.join(", "),
+          clause: source.clause_number ?? source.section_number ?? "not recorded",
+          id: source.document_id
+        }))}
+        getRowPath={(row) => `/policies/${String(row.id)}`}
+      />
+    </section>
+  );
+}
+
+function DocumentsPage({ accessToken }: { accessToken: string }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [title, setTitle] = useState("");
+  const [classification, setClassification] = useState("internal");
+  const [state, setState] = useState<PageState<DocumentUploadResult>>({ status: "idle" });
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!file || !title.trim()) return;
+    setState({ status: "loading" });
+    try {
+      setState({ status: "success", data: await uploadDocument({ file, title: title.trim(), classification }, accessToken) });
+    } catch (reason) {
+      setState(isDenied(reason) ? { status: "unauthorized", message: "Server denied document upload." } : { status: "error", message: errorMessage(reason) });
+    }
+  }
+  return (
+    <>
+      <PageHeader title="Document Upload" subtitle="Existing ingestion endpoint with validation, storage and review-required gates." />
+      <Panel title="Upload document" icon="upload">
+        <form className="upload-form" onSubmit={submit}>
+          <label>File<input onChange={(event) => setFile(event.target.files?.[0] ?? null)} type="file" /></label>
+          <label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+          <label>Classification<select value={classification} onChange={(event) => setClassification(event.target.value)}><option value="internal">Internal</option><option value="public">Public</option><option value="confidential">Confidential</option></select></label>
+          <button type="submit"><Icon name="upload" size={18} /> Upload</button>
+        </form>
+        <AsyncState state={state} render={(result) => <DocumentStatus result={result} />} />
+      </Panel>
+      <Panel title="Pipeline status" icon="refresh"><Unavailable capability="Document registry list and ingestion-stage timeline endpoint" /></Panel>
+    </>
+  );
+}
+
+function DocumentStatus({ result }: { result: DocumentUploadResult }) {
+  const doc = result.document;
+  return (
+    <DataTable
+      columns={[{ key: "field", label: "Field" }, { key: "value", label: "Value" }]}
+      rows={[
+        { field: "Document ID", value: <Link to={`/documents/${doc.canonical_document_id}`}>{doc.canonical_document_id}</Link> },
+        { field: "Status", value: doc.status },
+        { field: "Duplicate", value: result.duplicate ? "Yes" : "No" },
+        { field: "Checksum", value: doc.checksum_sha256 },
+        { field: "Size", value: `${doc.size_bytes} bytes` }
+      ]}
+    />
+  );
+}
+
+function DocumentDetailPage({ accessToken, documentId }: { accessToken: string; documentId: string }) {
+  return (
+    <>
+      <PageHeader title="Document Detail" subtitle={`Document ID: ${documentId}`} />
+      <DocumentDetail documentId={documentId} accessToken={accessToken} />
+    </>
+  );
+}
+
+function DocumentDetail({ documentId, accessToken = "" }: { documentId: string; accessToken?: string }) {
+  const [state, setState] = useState<PageState<DocumentMetadata>>({ status: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const doc = await loadDocument(documentId, accessToken);
+        if (!cancelled) setState({ status: "success", data: doc });
+      } catch (reason) {
+        if (!cancelled) setState(isDenied(reason) ? { status: "unauthorized", message: "Server denied document metadata." } : { status: "error", message: errorMessage(reason) });
+      }
+    }
+    void load();
+    return () => { cancelled = true; };
+  }, [accessToken, documentId]);
+  return <Panel title="Document metadata" icon="file"><AsyncState state={state} render={(doc) => <DocumentMetadataTable doc={doc} />} /></Panel>;
+}
+
+function DocumentMetadataTable({ doc }: { doc: DocumentMetadata }) {
+  return <DataTable columns={[{ key: "field", label: "Field" }, { key: "value", label: "Value" }]} rows={[
+    { field: "Title", value: doc.title },
+    { field: "Status", value: doc.status },
+    { field: "Version", value: String(doc.version_number) },
+    { field: "Classification", value: doc.classification },
+    { field: "Checksum", value: doc.checksum_sha256 },
+    { field: "Created", value: new Date(doc.created_at).toLocaleString() }
+  ]} />;
+}
+
+function AssistantPage({
+  me,
+  cases,
+  timeline,
+  demoActive,
+  demoAnswer,
+  busy,
+  caseMessage,
+  demoCaseMessage,
+  selectCase,
+  createDemoCase,
+  sendMessage,
+  sendDemoCaseMessage,
+  handoffToNo,
+  verifyByNo,
+  forwardToHod,
+  submitDemo,
+  setDemoQuestion,
+  demoQuestion,
+  setCaseMessage,
+  setDemoCaseMessage,
+  selectedCaseId
+}: AssistantProps) {
+  const { navigate } = useRouter();
+  const [search, setSearch] = useState("");
+  const [runtime, setRuntime] = useState<RuntimeHealth | null>(null);
+  const [retrievalReadiness, setRetrievalReadiness] = useState<RetrievalReadiness | null>(null);
+  const [runtimeUnavailable, setRuntimeUnavailable] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    async function refreshRuntime() {
+      try {
+        const health = await loadRuntimeHealth<RuntimeHealth>();
+        const readiness = await loadRetrievalReadiness();
+        if (!cancelled) {
+          setRuntime(health);
+          setRetrievalReadiness(readiness);
+          setRuntimeUnavailable(false);
+        }
+      } catch {
+        if (!cancelled) setRuntimeUnavailable(true);
+      }
+    }
+    void refreshRuntime();
+    const timer = window.setInterval(() => void refreshRuntime(), 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+  useEffect(() => {
+    if (selectedCaseId && timeline?.case.case_id !== selectedCaseId) void selectCase(selectedCaseId);
+  }, [selectedCaseId, selectCase, timeline?.case.case_id]);
+  const visibleCases = cases.filter((item) => item.title.toLowerCase().includes(search.toLowerCase()) || item.case_id.toLowerCase().includes(search.toLowerCase()));
+  return (
+    <>
+      <PageHeader title="AI Assistant" subtitle="Large chat workspace with case context and evidence drawer." />
+      <section className="assistant-layout">
+        <aside className="assistant-left">
+          {!isTenant(me) && <button className="full-button" onClick={createDemoCase} type="button"><Icon name="message" size={18} /> New Case</button>}
+          <SearchInput label="Search cases" value={search} onChange={setSearch} />
+          <div className="case-list">
+            {visibleCases.length === 0 ? <EmptyState title="No cases visible" text="No authorized cases match the current filter." /> : visibleCases.map((item) => (
+              <button className={item.case_id === selectedCaseId ? "case-card active" : "case-card"} key={item.case_id} onClick={() => navigate(`/assistant/cases/${item.case_id}`)} type="button">
+                <strong>{item.title}</strong><span>{item.state.replaceAll("_", " ")}</span><small>{item.case_id}</small>
+              </button>
+            ))}
+          </div>
+        </aside>
+        <section className="assistant-center">
+          <div className="assistant-header"><StatusBadge>{runtimeUnavailable ? "Backend unavailable" : retrievalReadiness?.ready_for_questions ? "Ready" : "Not ready"}</StatusBadge><span>{retrievalReadiness ? `${retrievalReadiness.indexed_documents} indexed documents · ${retrievalReadiness.embedded_child_chunks} embedded chunks · ${retrievalReadiness.generation_model} ${retrievalReadiness.generation_model_state}` : runtime ? `Backend ${runtime.runtime_id} is checking retrieval readiness.` : "Connecting to the configured backend."}</span></div>
+          <div className="chat-thread" aria-live="polite">
+            {!timeline && <EmptyState title="Open or create a case" text="The assistant can answer controlled questions without a case, but handoff evidence is attached only when a case is open." />}
+            {timeline?.messages.map((message) => <article className="assistant-bubble" key={message.message_id}><strong>{message.author_role}</strong><p>{message.body}</p><small>{new Date(message.created_at).toLocaleString()}</small></article>)}
+            {demoAnswer && <article className="assistant-bubble result"><p>{demoAnswer.answer}</p>{demoAnswer.structured && <StructuredEvidence answer={demoAnswer} />}{demoAnswer.document && <EvidencePanel answer={demoAnswer.document} />}</article>}
+          </div>
+          <form className="chat-form" onSubmit={submitDemo}>
+            <textarea aria-label="Assistant question" value={demoQuestion} onChange={(event) => setDemoQuestion(event.target.value)} placeholder="Ask about authorized bills, leases, estates, plots, policies or cases." rows={2} />
+            <button type="submit"><Icon name="send" size={18} /> Send</button>
+          </form>
+        </section>
+        <aside className="assistant-right">
+          <Panel title="Evidence and Context" icon="file">
+            <ContextDrawer timeline={timeline} demoAnswer={demoAnswer} />
+          </Panel>
+          {timeline && <WorkflowActions me={me} timeline={timeline} handoffToNo={handoffToNo} verifyByNo={verifyByNo} forwardToHod={forwardToHod} />}
+          {timeline && (
+            <Panel title="Case Observation" icon="message">
+              <form className="message-form" onSubmit={demoActive ? sendDemoCaseMessage : sendMessage}>
+                <input aria-label="Case observation" value={demoActive ? demoCaseMessage : caseMessage} onChange={(event) => demoActive ? setDemoCaseMessage(event.target.value) : setCaseMessage(event.target.value)} />
+                <button type="submit">Record</button>
+              </form>
+            </Panel>
+          )}
+        </aside>
+      </section>
+    </>
+  );
+}
+
+interface AssistantProps {
+  me: Me;
+  cases: CaseRecord[];
+  timeline: CaseTimeline | null;
+  demoActive: boolean;
+  demoAnswer: DemoAnswer | null;
+  busy: boolean;
+  caseMessage: string;
+  demoCaseMessage: string;
+  demoQuestion: string;
+  selectCase: (caseId: string) => Promise<void>;
+  createDemoCase: () => void;
+  sendMessage: (event: FormEvent) => void;
+  sendDemoCaseMessage: (event: FormEvent) => void;
+  handoffToNo: () => void;
+  verifyByNo: () => void;
+  forwardToHod: () => void;
+  submitDemo: (event: FormEvent) => void;
+  setDemoQuestion: (value: string) => void;
+  setCaseMessage: (value: string) => void;
+  setDemoCaseMessage: (value: string) => void;
+  selectedCaseId?: string;
+}
+
+function StructuredEvidence({ answer }: { answer: DemoAnswer }) {
+  if (!answer.structured) return null;
+  return <DataTable columns={[{ key: "facts", label: "Structured facts" }]} rows={answer.structured.rows.map((row) => ({ facts: Object.entries(row).filter(([key]) => key !== "source_refreshed_at").map(([key, value]) => `${key.replaceAll("_", " ")}: ${value ?? "not recorded"}`).join("; ") }))} />;
+}
+
+function ContextDrawer({ timeline, demoAnswer }: { timeline: CaseTimeline | null; demoAnswer: DemoAnswer | null }) {
+  const capsule = timeline?.capsules.at(-1);
+  return (
+    <div className="context-tabs">
+      <h3>Sources</h3>
+      {demoAnswer?.document ? <EvidencePanel answer={demoAnswer.document} /> : <p>Document sources appear after a RAG answer.</p>}
+      <h3>Context Capsule</h3>
+      {capsule ? <><p><strong>Case:</strong> {timeline?.case.case_id}</p><p><strong>State:</strong> {capsule.current_state.replaceAll("_", " ")}</p><p>{capsule.rolling_summary}</p></> : <p>No case capsule is open.</p>}
+      <h3>Query Details</h3>
+      <p>{demoAnswer?.structured ? demoAnswer.structured.database_objects.join(", ") : "No structured query has run in this conversation."}</p>
+    </div>
+  );
+}
+
+function WorkflowActions({ me, timeline, handoffToNo, verifyByNo, forwardToHod }: { me: Me; timeline: CaseTimeline; handoffToNo: () => void; verifyByNo: () => void; forwardToHod: () => void }) {
+  const isDo = me.roles.includes("Data Entry Operator");
+  const isNo = me.roles.includes("Nodal/Regional Officer");
+  return (
+    <Panel title="Workflow" icon="shield">
+      <ol className="timeline-list">{timeline.transitions.map((item) => <li key={item.transition_id}><strong>{item.to_state.replaceAll("_", " ")}</strong><span>{item.actor_role} - {new Date(item.occurred_at).toLocaleString()}</span></li>)}</ol>
+      <div className="handoff-actions">
+        {isDo && timeline.case.state === "draft" && <button onClick={handoffToNo} type="button">Submit to NO</button>}
+        {isNo && timeline.case.state === "submitted_to_no" && <button onClick={verifyByNo} type="button">Verify</button>}
+        {isNo && timeline.case.state === "verified_by_no" && <button onClick={forwardToHod} type="button">Submit to HOD</button>}
+      </div>
+    </Panel>
+  );
+}
+
+function AuditPage({ audit }: { audit: AuditEvent[] }) {
+  return (
+    <>
+      <PageHeader title="Audit Logs" subtitle="Immutable read-only activity visible to the current server-issued role." />
+      <FilterBar><SearchInput label="Filter audit rows" value="" onChange={() => undefined} /><label>Result<select><option>All results</option><option>ALLOWED</option><option>DENIED</option><option>ERROR</option></select></label></FilterBar>
+      <Panel title="Visible Activity" icon="file">
+        <DataTable
+          columns={[{ key: "time", label: "Timestamp" }, { key: "action", label: "Action" }, { key: "result", label: "Result" }, { key: "correlation", label: "Correlation ID" }]}
+          rows={audit.map((item) => ({ time: new Date(item.occurred_at).toLocaleString(), action: item.query_category, result: item.result_status, correlation: item.correlation_id }))}
+        />
+      </Panel>
+    </>
+  );
+}
+
+function ApprovalsPage({ cases }: { cases: CaseRecord[] }) {
+  const reviewCases = cases.filter((item) => ["submitted_to_no", "verified_by_no", "submitted_to_hod", "returned_to_no"].includes(item.state));
+  return (
+    <>
+      <PageHeader title="Approval Queue" subtitle="Conditional review queue for Nodal/Regional Officer and HOD roles." />
+      <Panel title="Cases awaiting review" icon="shield"><CaseTable cases={reviewCases} /></Panel>
+    </>
+  );
+}
+
+function AnalyticsPage() {
+  return (
+    <>
+      <PageHeader title="Analytics" subtitle="Role-scoped analytics area. Backend aggregation endpoints are still required for operational charts." />
+      <section className="dashboard-grid">
+        <Panel title="Estate Portfolio" icon="map"><Unavailable capability="Estate portfolio aggregation endpoint" /></Panel>
+        <Panel title="Revenue and Outstanding" icon="rupee"><Unavailable capability="Revenue aggregation endpoint" /></Panel>
+        <Panel title="Workflow SLA" icon="calendar"><Unavailable capability="Workflow SLA aggregation endpoint" /></Panel>
+        <Panel title="Document Ingestion" icon="upload"><Unavailable capability="Document ingestion analytics endpoint" /></Panel>
+      </section>
+    </>
+  );
+}
+
+function ForecastingPage() {
+  return <><PageHeader title="Forecasting" subtitle="Forecast outputs must include model, version, training period, metrics and limitations." /><Panel title="Forecast overview" icon="bar"><Unavailable capability="Approved forecast result endpoint" /></Panel></>;
+}
+
+function LegalCasesPage() {
+  return <><PageHeader title="Legal Cases" subtitle="Governed estate/legal module awaiting backend list and detail APIs." /><Panel title="Legal case register" icon="building"><Unavailable capability="Legal case register endpoint" /></Panel></>;
+}
+
+function NotFoundPage() {
+  return <div className="state-card denied-state"><h1>404</h1><h2>Page not found</h2><p>The requested route is not part of the AI Powered Port Management System.</p><Link to="/dashboard">Return to dashboard</Link></div>;
+}
+
+function AppRuntime() {
   const [cases, setCases] = useState<CaseRecord[]>([]);
   const [timeline, setTimeline] = useState<CaseTimeline | null>(null);
   const [me, setMe] = useState<Me | null>(null);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
-  const [policyQuestion, setPolicyQuestion] = useState("");
-  const [policyAnswer, setPolicyAnswer] = useState<GroundedAnswer | null>(null);
-  const [structuredQuestion, setStructuredQuestion] = useState("");
-  const [structuredAnswer, setStructuredAnswer] = useState<StructuredAnswer | null>(null);
-  const [messageBody, setMessageBody] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [denial, setDenial] = useState<string | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [demoAvailable, setDemoAvailable] = useState(false);
@@ -245,10 +1027,14 @@ export default function App() {
   const [demoActive, setDemoActive] = useState(false);
   const [demoQuestion, setDemoQuestion] = useState("");
   const [demoAnswer, setDemoAnswer] = useState<DemoAnswer | null>(null);
-  const [demoCases, setDemoCases] = useState<CaseRecord[]>([]);
-  const [demoTimeline, setDemoTimeline] = useState<CaseTimeline | null>(null);
   const [demoCaseMessage, setDemoCaseMessage] = useState("");
+  const [caseMessage, setCaseMessage] = useState("");
   const accessToken = window.pmsAuth?.accessToken ?? "";
+  const { pathname, navigate } = useRouter();
+
+  async function refreshCases(token = accessToken) {
+    setCases(await loadCaseQueue(token));
+  }
 
   useEffect(() => {
     setBusy(true);
@@ -270,47 +1056,250 @@ export default function App() {
       if (controlledDemoEnabled) {
         try {
           const identity = await loadDemoMe();
-          setAuthenticated(true); setMe(identity); setDemoActive(true); setError(null);
-          setDemoCases(await loadCaseQueue(""));
-          setAuthChecked(true); setBusy(false);
+          setAuthenticated(true);
+          setMe(identity);
+          setDemoActive(true);
+          setError(null);
+          setCases(await loadCaseQueue(""));
+          try { setAudit(await loadAudit("")); } catch { setAudit([]); }
+          setAuthChecked(true);
           return;
-        } catch (reason: unknown) {
+        } catch (reason) {
           if (!(reason instanceof ApiError && reason.status === 401)) setError(errorMessage(reason));
         }
       }
       try {
         const identity = await loadMe(accessToken);
-      setAuthenticated(true); setMe(identity); setError(null);
-      if (identity.roles.includes("Tenant")) return;
-      setCases(await loadCaseQueue(accessToken));
-      try { setAudit(await loadAudit(accessToken)); } catch (reason: unknown) { if (!isDenied(reason)) setError(errorMessage(reason)); }
-      } catch (reason: unknown) {
-        if (reason instanceof ApiError && reason.status === 401) { setAuthenticated(false); setError(null); } else setError(errorMessage(reason));
-      } finally { setAuthChecked(true); setBusy(false); }
+        setAuthenticated(true);
+        setMe(identity);
+        setError(null);
+        if (!identity.roles.includes("Tenant")) setCases(await loadCaseQueue(accessToken));
+        try { setAudit(await loadAudit(accessToken)); } catch { setAudit([]); }
+      } catch (reason) {
+        if (reason instanceof ApiError && reason.status === 401) {
+          setAuthenticated(false);
+          setError(null);
+        } else setError(errorMessage(reason));
+      } finally {
+        setAuthChecked(true);
+        setBusy(false);
+      }
     }
     void restoreSession();
   }, [accessToken]);
 
-  async function selectCase(caseId: string) { try { setError(null); setTimeline(await loadTimeline(caseId, accessToken)); } catch (reason: unknown) { setError(errorMessage(reason)); } }
-  async function sendMessage(event: FormEvent) { event.preventDefault(); if (!timeline || !messageBody.trim()) return; try { setBusy(true); await postCaseMessage(timeline.case.case_id, messageBody.trim(), accessToken); setMessageBody(""); setTimeline(await loadTimeline(timeline.case.case_id, accessToken)); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function submitPolicy(event: FormEvent) { event.preventDefault(); if (!policyQuestion.trim()) return; try { setBusy(true); setDenial(null); setPolicyAnswer(await runPolicyQuery(policyQuestion.trim(), accessToken)); } catch (reason: unknown) { setPolicyAnswer(null); if (isDenied(reason)) setDenial("Policy access denied by the server ACL."); else setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function submitStructured(event: FormEvent) { event.preventDefault(); if (!structuredQuestion.trim()) return; try { setBusy(true); setDenial(null); setStructuredAnswer(await runStructuredQuery(structuredQuestion.trim(), accessToken)); setAudit(await loadAudit(accessToken)); } catch (reason: unknown) { setStructuredAnswer(null); if (isDenied(reason)) { setDenial("Structured query denied; the denial is audit-recorded."); } else setError(errorMessage(reason)); } finally { setBusy(false); } }
+  async function selectCase(caseId: string) {
+    try {
+      setError(null);
+      setTimeline(await loadTimeline(caseId, demoActive ? "" : accessToken));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
 
-  async function startDemo(identity: DemoIdentity) { try { setBusy(true); setError(null); const demoIdentity = await startDemoSession(identity); setMe(demoIdentity); setDemoCases(await loadCaseQueue("")); setDemoActive(true); setAuthenticated(true); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function startLocalLogin(username: string, password: string, role: LocalLoginRole) { try { setBusy(true); setError(null); const identity = await loginLocally(username, password, role); setMe(identity); setAuthenticated(true); setDemoActive(false); if (!identity.roles.includes("Tenant")) setCases(await loadCaseQueue("")); } catch (reason: unknown) { setAuthenticated(false); setMe(null); setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function exitDemo() { try { await endDemoSession(); } catch { /* The local session is removed from the UI even if the API has stopped. */ } setDemoActive(false); setAuthenticated(false); setMe(null); setDemoAnswer(null); setDemoCases([]); setDemoTimeline(null); setDemoCaseMessage(""); }
-  async function refreshDemoTimeline(caseId: string) { const next = await loadTimeline(caseId, ""); setDemoTimeline(next); setDemoCases(await loadCaseQueue("")); }
-  async function createDemoCase() { try { setBusy(true); setError(null); const item = await createCase({ title: "Review of approved lease and applicable land-policy provision", objective: "Controlled local review of approved lease summaries and the selected indexed land-management clarification.", initial_message: "Controlled local case created. No tenant, agreement, financial, or active-lease assertion is made.", unit_id: "land" }, ""); await refreshDemoTimeline(item.case_id); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function selectDemoCase(caseId: string) { try { setError(null); await refreshDemoTimeline(caseId); } catch (reason: unknown) { setError(errorMessage(reason)); } }
-  async function submitDemo(event: FormEvent) { event.preventDefault(); if (!demoQuestion.trim()) return; try { setBusy(true); setError(null); const result = await runDemoQuery(demoQuestion.trim()); setDemoAnswer(result); if (demoTimeline && result.route !== "REQUEST_REFUSED" && !result.review_required) { const evidence = [ ...(result.structured ? [{ reference_type: "approved_query", reference_id: result.structured.query_id, version: result.structured.freshness_at }] : []), ...(result.document ? result.document.sources.map((source) => ({ reference_type: "document", reference_id: source.document_id, version: source.document_version_id })) : []) ]; await postCaseMessage(demoTimeline.case.case_id, `Controlled ${result.route} result: ${result.answer}`, "", evidence); await refreshDemoTimeline(demoTimeline.case.case_id); } } catch (reason: unknown) { setDemoAnswer(null); setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function sendDemoCaseMessage(event: FormEvent) { event.preventDefault(); if (!demoTimeline || !demoCaseMessage.trim()) return; try { setBusy(true); await postCaseMessage(demoTimeline.case.case_id, demoCaseMessage.trim(), ""); setDemoCaseMessage(""); await refreshDemoTimeline(demoTimeline.case.case_id); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function handoffToNo() { if (!demoTimeline) return; try { setBusy(true); await submitToNo(demoTimeline.case.case_id, ""); await refreshDemoTimeline(demoTimeline.case.case_id); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function verifyByNo() { if (!demoTimeline) return; try { setBusy(true); await verifyCase(demoTimeline.case.case_id, ""); await refreshDemoTimeline(demoTimeline.case.case_id); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
-  async function forwardToHod() { if (!demoTimeline) return; try { setBusy(true); await submitToHod(demoTimeline.case.case_id, ""); await refreshDemoTimeline(demoTimeline.case.case_id); } catch (reason: unknown) { setError(errorMessage(reason)); } finally { setBusy(false); } }
+  async function startDemo(identity: DemoIdentity) {
+    try {
+      setBusy(true);
+      setError(null);
+      const demoIdentity = await startDemoSession(identity);
+      setMe(demoIdentity);
+      setCases(await loadCaseQueue(""));
+      try { setAudit(await loadAudit("")); } catch { setAudit([]); }
+      setDemoActive(true);
+      setAuthenticated(true);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  if (!authChecked) return <main className="loading-page"><AppBrand /><p>Checking your protected PMS session…</p></main>;
-  if (!authenticated || !me) return <LoginScreen error={error} demoAvailable={demoAvailable} localAuthAvailable={localAuthAvailable} startDemo={startDemo} startLocalLogin={startLocalLogin} />;
-  if (demoActive) return <DemoWorkspace me={me} cases={demoCases} timeline={demoTimeline} question={demoQuestion} answer={demoAnswer} caseMessage={demoCaseMessage} busy={busy} error={error} setQuestion={setDemoQuestion} setCaseMessage={setDemoCaseMessage} submit={submitDemo} createDemoCase={createDemoCase} selectCase={selectDemoCase} sendCaseMessage={sendDemoCaseMessage} handoffToNo={handoffToNo} verifyByNo={verifyByNo} forwardToHod={forwardToHod} exit={exitDemo} />;
-  const props: WorkspaceProps = { me, cases, timeline, audit, policyQuestion, policyAnswer, structuredQuestion, structuredAnswer, messageBody, busy, error, denial, setPolicyQuestion, setStructuredQuestion, setMessageBody, selectCase, submitPolicy, submitStructured, sendMessage };
-  return isTenant(me) ? <TenantWorkspace {...props} /> : <StaffWorkspace {...props} />;
+  async function startLocalLogin(username: string, password: string, role: LocalLoginRole) {
+    try {
+      setBusy(true);
+      setError(null);
+      const identity = await loginLocally(username, password, role);
+      setMe(identity);
+      setAuthenticated(true);
+      setDemoActive(false);
+      if (!identity.roles.includes("Tenant")) await refreshCases("");
+      try { setAudit(await loadAudit("")); } catch { setAudit([]); }
+      navigate("/dashboard", { replace: true });
+    } catch (reason) {
+      setAuthenticated(false);
+      setMe(null);
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exitDemo() {
+    try { await endDemoSession(); } catch { /* Local UI exits even if API stopped. */ }
+    setDemoActive(false);
+    setAuthenticated(false);
+    setMe(null);
+    setDemoAnswer(null);
+    setTimeline(null);
+    setCases([]);
+    setAudit([]);
+    navigate("/", { replace: true });
+  }
+
+  async function returnHome() {
+    try {
+      if (demoActive) await endDemoSession();
+      else await endLocalSession();
+    } catch {
+      /* The public landing page remains available even if the API is not running. */
+    }
+    setDemoActive(false);
+    setAuthenticated(false);
+    setMe(null);
+    setDemoAnswer(null);
+    setTimeline(null);
+    setCases([]);
+    setAudit([]);
+    navigate("/", { replace: true });
+  }
+
+  async function createDemoCase() {
+    try {
+      setBusy(true);
+      const item = await createCase({
+        title: "Review of approved lease and applicable land-policy provision",
+        objective: "Controlled local review of approved lease summaries and indexed land-management evidence.",
+        initial_message: "Controlled local case created. No unverified operational assertion is made.",
+        unit_id: "land"
+      }, demoActive ? "" : accessToken);
+      await refreshCases(demoActive ? "" : accessToken);
+      setTimeline(await loadTimeline(item.case_id, demoActive ? "" : accessToken));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitDemo(event: FormEvent) {
+    event.preventDefault();
+    if (!demoQuestion.trim()) return;
+    try {
+      setBusy(true);
+      const result = await runDemoQuery(demoQuestion.trim());
+      setDemoAnswer(result);
+      if (timeline && result.route !== "REQUEST_REFUSED" && !result.review_required) {
+        await postCaseMessage(timeline.case.case_id, `Assistant result: ${result.answer}`, demoActive ? "" : accessToken);
+        setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
+      }
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendCaseMessage(event: FormEvent) {
+    event.preventDefault();
+    if (!timeline || !caseMessage.trim()) return;
+    await postCaseMessage(timeline.case.case_id, caseMessage.trim(), accessToken);
+    setCaseMessage("");
+    setTimeline(await loadTimeline(timeline.case.case_id, accessToken));
+  }
+
+  async function sendDemoCaseMessage(event: FormEvent) {
+    event.preventDefault();
+    if (!timeline || !demoCaseMessage.trim()) return;
+    await postCaseMessage(timeline.case.case_id, demoCaseMessage.trim(), "");
+    setDemoCaseMessage("");
+    setTimeline(await loadTimeline(timeline.case.case_id, ""));
+  }
+
+  async function handoffToNo() {
+    if (!timeline) return;
+    await submitToNo(timeline.case.case_id, demoActive ? "" : accessToken);
+    setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
+    await refreshCases(demoActive ? "" : accessToken);
+  }
+
+  async function verifyByNo() {
+    if (!timeline) return;
+    await verifyCase(timeline.case.case_id, demoActive ? "" : accessToken);
+    setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
+    await refreshCases(demoActive ? "" : accessToken);
+  }
+
+  async function forwardToHod() {
+    if (!timeline) return;
+    await submitToHod(timeline.case.case_id, demoActive ? "" : accessToken);
+    setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
+    await refreshCases(demoActive ? "" : accessToken);
+  }
+
+  if (!authChecked) return <LoadingSkeleton label="Checking your protected PMS session." />;
+  if (!authenticated || !me || pathname === "/") return <PublicLogin error={error} demoAvailable={demoAvailable} localAuthAvailable={localAuthAvailable} startDemo={startDemo} startLocalLogin={startLocalLogin} />;
+  const currentMe = me;
+
+  const assistantProps: AssistantProps = {
+    me: currentMe,
+    cases,
+    timeline,
+    demoActive,
+    demoAnswer,
+    busy,
+    caseMessage,
+    demoCaseMessage,
+    demoQuestion,
+    selectCase,
+    createDemoCase,
+    sendMessage: sendCaseMessage,
+    sendDemoCaseMessage,
+    handoffToNo,
+    verifyByNo,
+    forwardToHod,
+    submitDemo,
+    setDemoQuestion,
+    setCaseMessage,
+    setDemoCaseMessage
+  };
+
+  const currentPage = renderRoute(pathname);
+
+  function renderRoute(path: string): ReactNode {
+    if (path === "/dashboard") return <DashboardPage me={currentMe} cases={cases} audit={audit} demoActive={demoActive} />;
+    if (path === "/tenants") return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><RegistryPage module="tenants" /></ProtectedRoute>;
+    let params = matchRoute("/tenants/:tenantId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><DetailPage kind="tenant" id={params.tenantId} /></ProtectedRoute>;
+    if (path === "/leases") return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><RegistryPage module="leases" /></ProtectedRoute>;
+    params = matchRoute("/leases/:leaseId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><DetailPage kind="lease" id={params.leaseId} /></ProtectedRoute>;
+    if (path === "/land") return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><RegistryPage module="land" /></ProtectedRoute>;
+    params = matchRoute("/land/plots/:plotId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><DetailPage kind="plot" id={params.plotId} /></ProtectedRoute>;
+    if (path === "/policies") return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><PolicyPage /></ProtectedRoute>;
+    params = matchRoute("/policies/:documentId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><PolicyDetailPage documentId={params.documentId} /></ProtectedRoute>;
+    if (path === "/documents") return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><DocumentsPage accessToken={demoActive ? "" : accessToken} /></ProtectedRoute>;
+    params = matchRoute("/documents/:documentId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><DocumentDetailPage accessToken={demoActive ? "" : accessToken} documentId={params.documentId} /></ProtectedRoute>;
+    if (path === "/assistant") return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><AssistantPage {...assistantProps} /></ProtectedRoute>;
+    params = matchRoute("/assistant/cases/:caseId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><AssistantPage {...assistantProps} selectedCaseId={params.caseId} /></ProtectedRoute>;
+    if (path === "/analytics") return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><AnalyticsPage /></ProtectedRoute>;
+    if (path === "/audit") return <ProtectedRoute me={currentMe} allowed={REVIEW_ROLES}><AuditPage audit={audit} /></ProtectedRoute>;
+    if (path === "/approvals") return <ProtectedRoute me={currentMe} allowed={REVIEW_ROLES}><ApprovalsPage cases={cases} /></ProtectedRoute>;
+    params = matchRoute("/approvals/:caseId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={REVIEW_ROLES}><AssistantPage {...assistantProps} selectedCaseId={params.caseId} /></ProtectedRoute>;
+    if (path === "/forecasting") return <ProtectedRoute me={currentMe} allowed={HOD_ONLY}><ForecastingPage /></ProtectedRoute>;
+    if (path === "/legal-cases") return <ProtectedRoute me={currentMe} allowed={REVIEW_ROLES}><LegalCasesPage /></ProtectedRoute>;
+    params = matchRoute("/legal-cases/:caseId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={REVIEW_ROLES}><DetailPage kind="legal" id={params.caseId} /></ProtectedRoute>;
+    return <NotFoundPage />;
+  }
+
+  return <AppShell me={currentMe} demoActive={demoActive} exitDemo={exitDemo} returnHome={returnHome}>{error && <div className="notice" role="alert">{error}</div>}{currentPage}</AppShell>;
+}
+
+export default function App() {
+  return <BrowserRouter><AppRuntime /></BrowserRouter>;
 }

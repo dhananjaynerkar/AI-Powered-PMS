@@ -23,6 +23,7 @@ from pms_retrieval.models import (
     ChunkCitation,
     ChunkKind,
     ChunkWriteSummary,
+    CorpusStatus,
     DocumentChunk,
     EmbeddingPlan,
     EmbeddingWrite,
@@ -86,6 +87,8 @@ class ChunkRepository(Protocol):
         *,
         as_of_date: date,
     ) -> tuple[RetrievalHit, ...]: ...
+
+    def corpus_status(self) -> CorpusStatus: ...
 
     def deactivate_document(self, document_id: str) -> int: ...
 
@@ -638,6 +641,43 @@ class PostgresChunkRepository:
             },
         ).mappings()
         return tuple(_hit_from_row(dict(row)) for row in rows)
+
+    def corpus_status(self) -> CorpusStatus:
+        """Return ACL/RLS-scoped aggregate availability for the live corpus."""
+
+        row = self._connection.execute(
+            text(
+                """
+                SELECT
+                  count(DISTINCT record.canonical_document_id) AS indexed_documents,
+                  count(DISTINCT parent.chunk_id) AS accepted_parent_chunks,
+                  count(DISTINCT child.chunk_id) AS embedded_child_chunks
+                FROM pms_doc.document_record AS record
+                JOIN pms_vector.document_chunk AS parent
+                  ON parent.canonical_document_id = record.canonical_document_id
+                 AND parent.active
+                 AND parent.chunk_kind = 'parent'
+                 AND parent.review_status = 'accepted'
+                JOIN pms_vector.chunk_acl AS parent_acl
+                  ON parent_acl.chunk_id = parent.chunk_id
+                LEFT JOIN pms_vector.document_chunk AS child
+                  ON child.canonical_document_id = record.canonical_document_id
+                 AND child.document_version_id = parent.document_version_id
+                 AND child.active
+                 AND child.chunk_kind = 'child'
+                 AND child.review_status = 'accepted'
+                LEFT JOIN pms_vector.chunk_acl AS child_acl
+                  ON child_acl.chunk_id = child.chunk_id
+                LEFT JOIN pms_vector.chunk_embedding AS embedding
+                  ON embedding.chunk_id = child.chunk_id
+                 AND embedding.active
+                WHERE record.status = 'indexed'
+                  AND (child.chunk_id IS NULL OR child_acl.chunk_id IS NOT NULL)
+                  AND (child.chunk_id IS NULL OR embedding.chunk_id IS NOT NULL)
+                """
+            )
+        ).mappings().one()
+        return CorpusStatus.model_validate(dict(row))
 
     def deactivate_document(self, document_id: str) -> int:
         rows = self._connection.execute(

@@ -148,6 +148,31 @@ export interface DemoStatus {
   warning: string;
 }
 
+export interface RuntimeHealth {
+  status: string;
+  runtime_id: string;
+  process_id: number;
+  server_started_at: string;
+  api_port: number;
+  environment: string;
+  demo_mode: boolean;
+  generation_model: string;
+  fallback_enabled: boolean;
+  version: string;
+  configuration_fingerprint: string;
+  model_state: "warming" | "ready";
+}
+
+export interface RetrievalReadiness {
+  status: "ready" | "not_ready";
+  indexed_documents: number;
+  accepted_parent_chunks: number;
+  embedded_child_chunks: number;
+  generation_model: string;
+  generation_model_state: "loaded" | "available" | "not_installed" | "unavailable";
+  ready_for_questions: boolean;
+}
+
 export type DemoIdentity = "demo.do" | "demo.no" | "demo.hod";
 
 export type LocalLoginRole =
@@ -186,4 +211,24 @@ export interface DemoAnswer {
   correlation_id: string;
   duration_ms: number;
   evidence_extracted: boolean;
+}
+
+export interface DocumentMetadata {
+  canonical_document_id: string;
+  version_id: string;
+  version_number: number;
+  title: string;
+  original_filename: string;
+  status: string;
+  checksum_sha256: string;
+  size_bytes: number;
+  mime_type: string;
+  classification: string;
+  created_by_subject: string;
+  created_at: string;
+}
+
+export interface DocumentUploadResult {
+  document: DocumentMetadata;
+  duplicate: boolean;
 }

@@ -42,7 +42,9 @@ pdf-fallbacks = [
 ]
 retrieval = [
     "FlagEmbedding>=1.3,<2",
+    "huggingface-hub>=0.24,<1",
     "pgvector>=0.4,<1",
+    "torch>=2.3,<3",
     "transformers>=4.44.2,<5",
 ]
 ml = []

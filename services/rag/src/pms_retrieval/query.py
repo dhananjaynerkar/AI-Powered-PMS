@@ -44,16 +44,53 @@ _DIFFICULT_TERMS = frozenset(
 )
 _HINDI_MARKERS = frozenset({"क्या", "कब", "कौन", "कानून", "धारा", "आदेश", "नियम"})
 _MARATHI_MARKERS = frozenset({"काय", "केव्हा", "कोण", "कायदा", "कलम", "आदेश", "नियम"})
+_LEXICAL_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+_DEFINITION_QUESTION = re.compile(
+    r"\bwhat\s+(?:is|are)\s+(?:(?:an?|the)\s+)?(?P<term>[^?.,;:]{2,80})",
+    re.IGNORECASE,
+)
+_LEXICAL_STOP_WORDS = frozenset(
+    {
+        "a",
+        "about",
+        "according",
+        "an",
+        "and",
+        "based",
+        "does",
+        "document",
+        "explain",
+        "for",
+        "from",
+        "give",
+        "in",
+        "indexed",
+        "is",
+        "me",
+        "of",
+        "on",
+        "pdf",
+        "please",
+        "say",
+        "summarize",
+        "the",
+        "to",
+        "under",
+        "what",
+    }
+)
 
 
-def normalize_query(query: str) -> str:
+def normalize_query(query: str, *, maximum_length: int = 2000) -> str:
     """Normalize presentation differences without stemming legal terms."""
 
+    if maximum_length < 1:
+        raise ValueError("maximum query length must be positive")
     normalized = _SPACE.sub(" ", unicodedata.normalize("NFKC", query)).strip()
     if not normalized:
         raise ValueError("query must not be blank")
-    if len(normalized) > 2000:
-        raise ValueError("query must not exceed 2000 characters")
+    if len(normalized) > maximum_length:
+        raise ValueError(f"query must not exceed {maximum_length} characters")
     return normalized
 
 
@@ -62,8 +99,9 @@ def understand_query(
     *,
     today: date | None = None,
     response_language: ResponseLanguage = ResponseLanguage.AUTO,
+    maximum_length: int = 2000,
 ) -> QueryUnderstanding:
-    normalized = normalize_query(query)
+    normalized = normalize_query(query, maximum_length=maximum_length)
     mentioned_dates = _extract_dates(normalized)
     as_of_date = mentioned_dates[-1] if mentioned_dates else (today or date.today())
     lowered = normalized.casefold()
@@ -91,6 +129,42 @@ def understand_query(
         response_language=resolved_language,
         difficult=difficult,
     )
+
+
+def lexical_search_query(
+    query: str,
+    *,
+    maximum_terms: int = 12,
+    maximum_length: int = 2000,
+) -> str:
+    """Build a bounded PostgreSQL web-search query from conversational text.
+
+    Dense retrieval and reranking still receive the complete normalized question. This
+    rewrite only prevents filler words from turning lexical retrieval into an
+    accidental all-terms match that returns no candidates.
+    """
+
+    normalized = normalize_query(query, maximum_length=maximum_length)
+    definition = _DEFINITION_QUESTION.search(normalized)
+    if definition is not None:
+        subject_tokens = tuple(
+            token.casefold()
+            for token in _LEXICAL_TOKEN.findall(definition.group("term"))
+            if token.casefold() not in _LEXICAL_STOP_WORDS
+        )
+        if subject_tokens:
+            return " ".join((*subject_tokens[:4], "defined"))
+
+    terms = tuple(
+        dict.fromkeys(
+            token.casefold()
+            for token in _LEXICAL_TOKEN.findall(normalized)
+            if token.casefold() not in _LEXICAL_STOP_WORDS
+        )
+    )[:maximum_terms]
+    if not terms:
+        return normalized
+    return " OR ".join(terms)
 
 
 def document_pattern(document_type: str | None) -> str | None:

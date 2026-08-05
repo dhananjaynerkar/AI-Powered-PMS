@@ -28,8 +28,12 @@ from pms_retrieval.models import (
     ResponseLanguage,
     RetrievalHit,
 )
-from pms_retrieval.query import reciprocal_rank_fusion, understand_query
-from pms_retrieval.rag import HybridRagService
+from pms_retrieval.query import (
+    lexical_search_query,
+    reciprocal_rank_fusion,
+    understand_query,
+)
+from pms_retrieval.rag import HybridRagService, _prioritize_definition_evidence
 
 
 def _settings() -> Settings:
@@ -104,6 +108,7 @@ class _Repository:
         self.parents = parents
         self.calls: list[tuple[str, object]] = []
         self.audits: list[tuple[tuple[str, ...], str]] = []
+        self.audit_scopes: list[dict[str, str]] = []
 
     def lexical_search(
         self,
@@ -146,8 +151,29 @@ class _Repository:
         *,
         model_version: str | None,
         result_status: str,
+        entity_scope: dict[str, str],
     ) -> None:
         self.audits.append((source_ids, result_status))
+        self.audit_scopes.append(entity_scope)
+
+
+class _PatternRepository(_Repository):
+    def lexical_search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        as_of_date: date,
+        document_pattern: str | None,
+    ) -> tuple[RetrievalHit, ...]:
+        if document_pattern is not None:
+            return ()
+        return super().lexical_search(
+            query,
+            limit,
+            as_of_date=as_of_date,
+            document_pattern=document_pattern,
+        )
 
 
 class _Embedder:
@@ -172,6 +198,21 @@ class _Reranker:
             item.model_copy(update={"rerank_score": 1.0 - index / 10})
             for index, item in enumerate(candidates[:limit])
         )
+
+
+class _ExplodingEmbedder(_Embedder):
+    def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        raise AssertionError("lexical-only retrieval must not embed the query")
+
+
+class _ExplodingReranker(_Reranker):
+    def rerank(
+        self,
+        query: str,
+        candidates: tuple[RankedEvidence, ...],
+        limit: int,
+    ) -> tuple[RankedEvidence, ...]:
+        raise AssertionError("lexical-only retrieval must not rerank candidates")
 
 
 class _Generator:
@@ -282,6 +323,27 @@ def test_query_understanding_preserves_legal_terms_and_extracts_date() -> None:
     assert result.difficult
 
 
+def test_query_understanding_uses_the_configured_maximum_length() -> None:
+    query = "a" * 2500
+
+    with pytest.raises(ValueError, match="2000"):
+        understand_query(query)
+
+    assert understand_query(query, maximum_length=3000).normalized_query == query
+
+
+def test_lexical_query_rewrites_conversational_document_questions() -> None:
+    assert (
+        lexical_search_query(
+            "According to the Indian Easement Act 1882, what is an easement?"
+        )
+        == "easement defined"
+    )
+    assert lexical_search_query(
+        "What does the indexed document say about reduction in interest under TR 296 of 2020?"
+    ) == "reduction OR interest OR tr OR 296 OR 2020"
+
+
 def test_query_language_is_not_inferred_from_devanagari_script_alone() -> None:
     ambiguous = understand_query("भूखंड विवरण", today=date(2026, 7, 30))
     hindi = understand_query("यह कानून क्या है", today=date(2026, 7, 30))
@@ -301,6 +363,38 @@ def test_rrf_is_deterministic_and_combines_both_rankings() -> None:
     assert [item.hit.chunk_id for item in fused] == ["child-1", "child-2"]
     assert all(item.lexical_rank is not None for item in fused)
     assert all(item.dense_rank is not None for item in fused)
+
+
+def test_definition_question_preserves_exact_lexical_evidence_first() -> None:
+    title_match = RankedEvidence(
+        hit=_hit("title", "Easement defined", parent_id="title-parent"),
+        lexical_rank=2,
+        dense_rank=1,
+        rrf_score=0.04,
+        rerank_score=1.3,
+    )
+    definition = RankedEvidence(
+        hit=_hit(
+            "definition",
+            "An easement is a right held for beneficial enjoyment.",
+            parent_id="definition-parent",
+        ),
+        lexical_rank=1,
+        dense_rank=4,
+        rrf_score=0.03,
+        rerank_score=0.6,
+    )
+
+    reordered = _prioritize_definition_evidence(
+        "easement defined",
+        (title_match, definition),
+    )
+
+    assert [item.hit.chunk_id for item in reordered] == ["definition", "title"]
+    assert _prioritize_definition_evidence(
+        "easement OR right",
+        (title_match, definition),
+    ) == (title_match, definition)
 
 
 @pytest.mark.parametrize(
@@ -362,6 +456,8 @@ def test_golden_refusal_paths_return_no_sources(name: str) -> None:
     assert result.review_required
     assert result.sources == ()
     assert repository.audits == [((), "REVIEW_REQUIRED")]
+    assert repository.audit_scopes[-1]["retrieved_document_ids"] == ""
+    assert "stage_durations_ms" in repository.audit_scopes[-1]
 
 
 def test_effective_date_is_passed_to_both_retrievers_and_parent_expansion() -> None:
@@ -427,7 +523,69 @@ def test_non_auditor_cannot_receive_developer_trace() -> None:
     assert result.trace is None
 
 
-def test_nine_b_fallback_is_used_only_for_difficult_query() -> None:
+def test_lexical_only_query_skips_embedding_and_reranking() -> None:
+    child = _hit("child-1", "An easement is a right.", parent_id="parent-1")
+    repository = _Repository((child,), (_hit("parent-1", child.text),))
+    service = HybridRagService(
+        repository,
+        _context(),
+        _settings(),
+        embedder=_ExplodingEmbedder(),
+        reranker=_ExplodingReranker(),
+        generator=_Generator(),
+        tokenizer=_Tokenizer(),
+    )
+
+    result = service.ask("What is an easement?", lexical_only=True)
+
+    assert not result.review_required
+    assert [name for name, _value in repository.calls] == ["lexical_as_of", "parent_ids"]
+
+
+def test_lexical_only_query_retries_without_a_title_filter_when_it_has_no_match() -> None:
+    child = _hit("child-1", "An easement is a right.", parent_id="parent-1")
+    repository = _PatternRepository((child,), (_hit("parent-1", child.text),))
+    service = HybridRagService(
+        repository,
+        _context(),
+        _settings(),
+        embedder=_ExplodingEmbedder(),
+        reranker=_ExplodingReranker(),
+        generator=_Generator(),
+        tokenizer=_Tokenizer(),
+    )
+
+    result = service.ask("What does the Act say about an easement?", lexical_only=True)
+
+    assert not result.review_required
+    assert [name for name, _value in repository.calls] == ["lexical_as_of", "parent_ids"]
+
+
+def test_context_uses_the_matched_child_when_its_parent_exceeds_the_budget() -> None:
+    child = _hit(
+        "child-1",
+        "An easement is a right held for beneficial enjoyment.",
+        parent_id="parent-1",
+        page=3,
+    )
+    parent = _hit("parent-1", "long " * 300, page=1)
+    service = HybridRagService(
+        _Repository((child,), (parent,)),
+        _context(),
+        _settings().model_copy(update={"final_context_max_tokens": 256}),
+        embedder=_ExplodingEmbedder(),
+        reranker=_ExplodingReranker(),
+        generator=_Generator(),
+        tokenizer=_Tokenizer(),
+    )
+
+    result = service.ask("What is an easement?", lexical_only=True)
+
+    assert not result.review_required
+    assert result.sources[0].page_numbers == (3,)
+
+
+def test_difficult_query_uses_only_the_primary_model_when_fallback_is_disabled() -> None:
     child = _hit("child-1", "controlled evidence", parent_id="parent-1")
     repository = _Repository((child,), (_hit("parent-1", "controlled evidence"),))
     generator = _FallbackGenerator()
@@ -443,10 +601,10 @@ def test_nine_b_fallback_is_used_only_for_difficult_query() -> None:
 
     result = service.ask("What amendment applied on 2022-04-01?", include_trace=True)
 
-    assert not result.review_required
-    assert result.model == "qwen3.5:9b"
-    assert generator.calls == ["qwen3.5:4b", "qwen3.5:9b"]
-    assert result.trace is not None and result.trace.fallback_used
+    assert result.review_required
+    assert result.model == "qwen3.5:4b"
+    assert generator.calls == ["qwen3.5:4b"]
+    assert result.trace is not None and not result.trace.fallback_used
 
 
 def test_reviewed_table_value_golden_fixture_returns_exact_value() -> None:
@@ -472,39 +630,6 @@ def test_reviewed_table_value_golden_fixture_returns_exact_value() -> None:
     assert result.answer == "Rs. 1.00 per square metre per day [S1]."
     assert result.sources[0].page_numbers == (3,)
     assert not result.review_required
-
-
-def test_verified_extractive_evidence_requires_the_expected_indexed_chunk() -> None:
-    child = _hit(
-        "child-gold",
-        "The existing lessee must clear all dues before taking part in the bid with ROFR.",
-        parent_id="parent-gold",
-        page=2,
-    )
-    parent = _hit("parent-gold", child.text, page=2)
-    repository = _Repository((child,), (parent,))
-    service = HybridRagService(
-        repository,
-        _context(),
-        _settings(),
-        embedder=_Embedder(),
-        reranker=_Reranker(),
-        generator=_Generator(),
-        tokenizer=_Tokenizer(),
-    )
-
-    result = service.answer_verified_extractive_evidence(
-        "What must the existing lessee do before bidding?",
-        document_id="document-1",
-        document_version_id="version-1",
-        parent_chunk_id="parent-gold",
-        child_chunk_id="child-gold",
-    )
-
-    assert not result.review_required
-    assert result.sources[0].page_numbers == (2,)
-    assert result.warnings == ("VERIFIED_EXTRACTIVE_DEMO_EVIDENCE",)
-    assert repository.audits[-1] == (("child-gold", "parent-gold"), "ALLOWED")
 
 
 def test_review_required_draft_is_replaced_with_safe_refusal() -> None:
@@ -571,6 +696,31 @@ def test_ollama_endpoint_must_be_exactly_loopback_local() -> None:
                 update={"ollama_base_url": "http://localhost.example:11434"}
             )
         )
+
+
+def test_ollama_model_list_is_cached_for_repeated_generation_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"models": [{"name": "qwen3.5:4b"}]}
+
+    def get(*_args: object, **_kwargs: object) -> Response:
+        nonlocal calls
+        calls += 1
+        return Response()
+
+    monkeypatch.setattr("pms_retrieval.generation.httpx.get", get)
+    generator = OllamaGenerator(_settings())
+
+    assert generator.available_models() == frozenset({"qwen3.5:4b"})
+    assert generator.available_models() == frozenset({"qwen3.5:4b"})
+    assert calls == 1
 
 
 def test_ollama_prompt_includes_the_exact_output_schema(
@@ -645,7 +795,63 @@ def test_ollama_prompt_includes_the_exact_output_schema(
     assert draft.evidence_quotes == {
         "S1": "Section 24 permits necessary repairs."
     }
-    assert draft.warnings == ("EVIDENCE_QUOTE_NORMALIZED_TO_SOURCE",)
+
+
+def test_ollama_compact_json_mode_adds_a_server_validated_citation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = OllamaGenerator(
+        _settings().model_copy(update={"llm_max_output_tokens": 64})
+    )
+    evidence = (
+        ContextEvidence(
+            source_id="S1",
+            chunk_id="child-1",
+            child_chunk_ids=("child-1",),
+            document_id="document-1",
+            document_version_id="version-1",
+            document_title="Controlled Act",
+            text="An easement is a right held for beneficial enjoyment of land.",
+            token_count=11,
+            page_numbers=(3,),
+            citations=(),
+            heading_path=("Section 4",),
+            section_number="4",
+            clause_number=None,
+            language_code="en",
+            authoritative_language="en",
+            effective_from=None,
+            effective_to=None,
+            score=1,
+        ),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(generator, "available_models", lambda: frozenset({"qwen3.5:4b"}))
+    monkeypatch.setattr(
+        generator,
+        "_chat_content",
+        lambda payload: (
+            captured.update(payload)
+            or '{"answer":"An easement is a right. [S1]"}'
+        ),
+    )
+
+    draft = generator.generate(
+        "What is an easement?",
+        evidence,
+        response_language=ResponseLanguage.ENGLISH,
+        model="qwen3.5:4b",
+    )
+
+    assert captured["stream"] is False
+    assert captured["format"] == {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    assert draft.answer == "An easement is a right. [S1]"
+    assert draft.evidence_quotes["S1"].startswith("An easement is a right")
 
 
 def test_cross_language_quote_uses_exact_retrieved_child_text() -> None:

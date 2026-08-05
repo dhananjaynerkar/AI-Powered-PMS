@@ -84,7 +84,8 @@ def test_phase08_settings_are_typed_bounded_and_fail_closed() -> None:
     assert configured.final_context_max_tokens == 5000
     assert configured.reranker_model == "BAAI/bge-reranker-v2-m3"
     assert configured.llm_primary_model == "qwen3.5:4b"
-    assert configured.llm_fallback_model == "qwen3.5:9b"
+    assert configured.llm_fallback_model == "qwen3.5:4b"
+    assert not configured.llm_allow_fallback
     assert not configured.llm_thinking_enabled
     assert configured.llm_citation_validation_enabled
     assert configured.llm_refuse_without_evidence

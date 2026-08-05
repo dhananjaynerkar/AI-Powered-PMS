@@ -8,11 +8,21 @@ from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 from pms_api.app import create_app, get_authorization_context
 from pms_common.security import AuthorizationContext, AuthorizationDenied, Classification, UserRole
-from pms_retrieval.models import ChunkCitation, GroundedAnswer, SourceCitation
+from pms_retrieval.models import ChunkCitation, CorpusStatus, GroundedAnswer, SourceCitation
 from pms_structured.models import QueryRoute, StructuredAnswer, StructuredQuery
 
 
 class StubRagService:
+    def corpus_status(self) -> CorpusStatus:
+        return CorpusStatus(
+            indexed_documents=2,
+            accepted_parent_chunks=4,
+            embedded_child_chunks=6,
+        )
+
+    def generation_model_state(self) -> str:
+        return "loaded"
+
     def ask(self, question: str, **_: object) -> GroundedAnswer:
         assert question == "What is the approved policy?"
         return GroundedAnswer(
@@ -112,6 +122,10 @@ def test_demonstrable_workflow_authorized_policy_structured_and_audit() -> None:
     async def scenario() -> None:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             assert (await client.get("/health/live")).json()["status"] == "ok"
+            readiness = await client.get(
+                "/api/v1/retrieval/readiness",
+                headers={"Authorization": "Bearer token"},
+            )
             me = await client.get(
                 "/api/v1/me",
                 headers={"Authorization": "Bearer token"},
@@ -132,6 +146,16 @@ def test_demonstrable_workflow_authorized_policy_structured_and_audit() -> None:
             )
 
         assert policy.status_code == 200
+        assert readiness.json() == {
+            "status": "ready",
+            "phase": "13",
+            "indexed_documents": 2,
+            "accepted_parent_chunks": 4,
+            "embedded_child_chunks": 6,
+            "generation_model": "qwen3.5:4b",
+            "generation_model_state": "loaded",
+            "ready_for_questions": True,
+        }
         assert me.status_code == 200
         assert policy.json()["sources"][0]["page_numbers"] == [4]
         assert structured.status_code == 200

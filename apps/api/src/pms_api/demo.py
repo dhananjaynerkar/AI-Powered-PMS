@@ -148,22 +148,6 @@ def demo_principal(context: AuthorizationContext) -> DemoPrincipal:
 
 DEMO_PRINCIPAL = demo_principal(DEMO_CONTEXT)
 
-GOLD_POLICY_QUESTION = (
-    "According to Clarification 1, when a lease has expired and has no renewal "
-    "clause, what must the existing lessee do to take part in the bid with ROFR?"
-)
-GOLD_COMBINED_QUESTION = (
-    "Show five approved lease summaries and, separately, according to Clarification 1, "
-    "when a lease has expired and has no renewal clause, what must the existing lessee "
-    "do to take part in the bid with ROFR?"
-)
-GOLD_POLICY_RETRIEVAL_QUERY = "lease expired renewal clause existing lessee ROFR"
-GOLD_POLICY_DOCUMENT_ID = "d6a611d8-5c2e-4617-b5ae-1eb824071ff7"
-GOLD_POLICY_DOCUMENT_VERSION_ID = "a62dfbef-fa4f-4260-88db-d59d22586be2"
-GOLD_POLICY_PARENT_CHUNK_ID = "36887b628ce53ad5d95c7d2ae14a3e2dae2d1bed9d59c35497c28255a39fa6af"
-GOLD_POLICY_CHILD_CHUNK_ID = "ebe722cb480c5934ea7846794ccbf99f450195fbab35683f6de0fd70f137929e"
-
-
 def demo_is_enabled(settings: Settings) -> bool:
     return (
         settings.pms_demo_mode
@@ -214,26 +198,6 @@ def demo_context_from_session(
 
 def normalize_demo_question(question: str) -> str:
     return " ".join(question.casefold().split()).rstrip("?.")
-
-
-def is_gold_policy_question(question: str) -> bool:
-    return normalize_demo_question(question) == normalize_demo_question(GOLD_POLICY_QUESTION)
-
-
-def uses_gold_policy_evidence(question: str) -> bool:
-    """Return whether the controlled question uses the pre-verified evidence set."""
-
-    normalized = normalize_demo_question(question)
-    return normalized in {
-        normalize_demo_question(GOLD_POLICY_QUESTION),
-        normalize_demo_question(GOLD_COMBINED_QUESTION),
-    }
-
-
-def demo_retrieval_query(question: str) -> str:
-    """Avoid title-based document-type filtering for the registered gold evidence."""
-
-    return GOLD_POLICY_RETRIEVAL_QUERY if uses_gold_policy_evidence(question) else question
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,11 +290,13 @@ def route_demo_question(question: str) -> tuple[DemoRoute, str | None]:
         or _SENSITIVE_REQUEST.search(normalized)
     ):
         return DemoRoute.REQUEST_REFUSED, None
-    if normalize_demo_question(question) == normalize_demo_question(GOLD_COMBINED_QUESTION):
-        return DemoRoute.COMBINED, "approved_leases"
-    if is_gold_policy_question(question):
-        return DemoRoute.DOCUMENT_RAG, None
-    document = bool(re.search(r"\b(?:policy|act|circular|clause)\b|\boffice order\b", normalized))
+    document = bool(
+        re.search(
+            r"\b(?:policy|act|circular|clause|document|pdf|rules?|notification)\b"
+            r"|\boffice order\b",
+            normalized,
+        )
+    )
     query_id: str | None = None
     if any(word in normalized for word in ("lease", "leases", "agreement")):
         query_id = "approved_leases"
@@ -428,7 +394,11 @@ class PostgresDemoStructuredProvider:
 def review_required_answer(question: str) -> DemoAnswer:
     del question
     return DemoAnswer(
-        answer="The controlled demo supports only approved policy and operational intents.",
+        answer=(
+            "No specific case context is currently loaded, and no verified evidence was "
+            "selected for this question. Ask about an authorized indexed PDF, policy, Act, "
+            "bill, lease, estate, division, unit or plot, or open a case to attach context."
+        ),
         route=DemoRoute.REVIEW_REQUIRED,
         principal=DEMO_PRINCIPAL,
         warnings=("No document retrieval or database query was executed.",),

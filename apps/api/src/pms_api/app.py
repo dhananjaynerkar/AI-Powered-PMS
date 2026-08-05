@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 import urllib.error
@@ -12,8 +13,10 @@ import urllib.parse
 import urllib.request
 from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Literal, Protocol, cast
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
@@ -48,9 +51,15 @@ from pms_ingestion.service import (
 )
 from pms_ingestion.storage import MinioObjectStore, ObjectStorageError
 from pms_ingestion.validation import UploadValidationError
-from pms_retrieval.generation import GenerationError
+from pms_retrieval.embedding import (
+    BgeM3EmbeddingAdapter,
+    BgeM3Tokenizer,
+    EmbeddingError,
+)
+from pms_retrieval.generation import GenerationError, OllamaGenerator
 from pms_retrieval.models import GroundedAnswer
 from pms_retrieval.rag import HybridRagService, PostgresRagRepository
+from pms_retrieval.reranking import BgeReranker, RerankingError
 from pms_rule_engine.engine import RuleCalculationEngine
 from pms_rule_engine.models import (
     CalculationResult,
@@ -73,10 +82,6 @@ from starlette.responses import RedirectResponse, Response
 from pms_api.audit import AuditService, AuditServiceProvider, PostgresAuditServiceProvider
 from pms_api.demo import (
     DEMO_CONTEXTS,
-    GOLD_POLICY_CHILD_CHUNK_ID,
-    GOLD_POLICY_DOCUMENT_ID,
-    GOLD_POLICY_DOCUMENT_VERSION_ID,
-    GOLD_POLICY_PARENT_CHUNK_ID,
     DemoAnswer,
     DemoConfigurationError,
     DemoPrincipal,
@@ -91,12 +96,10 @@ from pms_api.demo import (
     demo_context_from_session,
     demo_is_enabled,
     demo_principal,
-    demo_retrieval_query,
     issue_demo_session,
     refused_answer,
     review_required_answer,
     route_demo_question,
-    uses_gold_policy_evidence,
 )
 from pms_api.local_auth import (
     LocalAuthenticationError,
@@ -117,6 +120,8 @@ from pms_api.schemas import (
     MessageResponse,
     PolicyQueryRequest,
     RemarksRequest,
+    RetrievalReadinessResponse,
+    RuntimeHealthResponse,
     TimelineResponse,
 )
 from pms_api.semantic_demo import (
@@ -270,21 +275,64 @@ class PostgresRuleServiceProvider:
 
 
 class PostgresRagServiceProvider:
-    """Create a transaction-bounded hybrid retrieval service."""
+    """Create scoped retrieval services backed by one process-wide model set."""
 
     def __init__(self, engine: Engine, settings: Settings) -> None:
         self._engine = engine
         self._settings = settings
+        self._resource_lock = Lock()
+        self._embedder: BgeM3EmbeddingAdapter | None = None
+        self._reranker: BgeReranker | None = None
+        self._generator: OllamaGenerator | None = None
+        self._tokenizer: BgeM3Tokenizer | None = None
+
+    def _resources(
+        self,
+    ) -> tuple[BgeM3EmbeddingAdapter, BgeReranker, OllamaGenerator, BgeM3Tokenizer]:
+        """Initialize local model adapters once and reuse their lazy model instances."""
+
+        if (
+            self._embedder is not None
+            and self._reranker is not None
+            and self._generator is not None
+            and self._tokenizer is not None
+        ):
+            return self._embedder, self._reranker, self._generator, self._tokenizer
+        with self._resource_lock:
+            if (
+                self._embedder is None
+                or self._reranker is None
+                or self._generator is None
+                or self._tokenizer is None
+            ):
+                embedder = BgeM3EmbeddingAdapter(self._settings)
+                reranker = BgeReranker(self._settings)
+                generator = OllamaGenerator(self._settings)
+                tokenizer = BgeM3Tokenizer(self._settings)
+                self._embedder = embedder
+                self._reranker = reranker
+                self._generator = generator
+                self._tokenizer = tokenizer
+        assert self._embedder is not None
+        assert self._reranker is not None
+        assert self._generator is not None
+        assert self._tokenizer is not None
+        return self._embedder, self._reranker, self._generator, self._tokenizer
 
     @contextmanager
     def __call__(
         self,
         context: AuthorizationContext,
     ) -> Iterator[HybridRagService]:
+        embedder, reranker, generator, tokenizer = self._resources()
         yield HybridRagService(
             PostgresRagRepository(self._engine, context),
             context,
             self._settings,
+            embedder=embedder,
+            reranker=reranker,
+            generator=generator,
+            tokenizer=tokenizer,
         )
 
 
@@ -646,6 +694,23 @@ def create_app(
     """Create the API without a hidden global database connection."""
 
     app = FastAPI(title="AI Powered PMS", version="0.1.0")
+    runtime_started_at = datetime.now(UTC)
+    runtime_settings = _settings()
+    runtime_fingerprint = hashlib.sha256(
+        "|".join(
+            (
+                runtime_settings.app_env,
+                str(runtime_settings.app_port),
+                str(demo_is_enabled(runtime_settings)),
+                runtime_settings.llm_primary_model,
+                str(runtime_settings.llm_allow_fallback),
+                runtime_settings.app_version,
+            )
+        ).encode()
+    ).hexdigest()[:16]
+    runtime_id = hashlib.sha256(
+        f"{os.getpid()}|{runtime_started_at.isoformat()}|{runtime_fingerprint}".encode()
+    ).hexdigest()[:12]
     app.state.case_service_provider = service_provider
     app.state.document_service_provider = document_service_provider
     app.state.structured_service_provider = structured_service_provider
@@ -849,6 +914,52 @@ def create_app(
         )
         return HealthResponse(status="ready" if configured else "not_ready")
 
+    @app.get("/health/runtime", response_model=RuntimeHealthResponse)
+    def health_runtime() -> RuntimeHealthResponse:
+        provider: PostgresRagServiceProvider | None = cast(
+            PostgresRagServiceProvider | None,
+            getattr(app.state, "rag_service_provider", None),
+        )
+        model_state = "ready"
+        if provider is not None and provider._generator is None:
+            model_state = "warming"
+        return RuntimeHealthResponse(
+            status="ready",
+            runtime_id=runtime_id,
+            process_id=os.getpid(),
+            server_started_at=runtime_started_at,
+            api_port=runtime_settings.app_port,
+            environment=runtime_settings.app_env,
+            demo_mode=demo_is_enabled(runtime_settings),
+            generation_model=runtime_settings.llm_primary_model,
+            fallback_enabled=runtime_settings.llm_allow_fallback,
+            version=runtime_settings.app_version,
+            configuration_fingerprint=runtime_fingerprint,
+            model_state=model_state,
+        )
+
+    @app.get(
+        "/api/v1/retrieval/readiness",
+        response_model=RetrievalReadinessResponse,
+    )
+    def retrieval_readiness(service: RagServiceDependency) -> RetrievalReadinessResponse:
+        corpus = service.corpus_status()
+        model_state = service.generation_model_state()
+        ready_for_questions = (
+            corpus.indexed_documents > 0
+            and corpus.embedded_child_chunks > 0
+            and model_state in {"loaded", "available"}
+        )
+        return RetrievalReadinessResponse(
+            status="ready" if ready_for_questions else "not_ready",
+            indexed_documents=corpus.indexed_documents,
+            accepted_parent_chunks=corpus.accepted_parent_chunks,
+            embedded_child_chunks=corpus.embedded_child_chunks,
+            generation_model=runtime_settings.llm_primary_model,
+            generation_model_state=model_state,
+            ready_for_questions=ready_for_questions,
+        )
+
     @app.get("/api/v1/demo/status", response_model=DemoStatus)
     def demo_status() -> DemoStatus:
         return DemoStatus(enabled=demo_is_enabled(_settings()))
@@ -980,16 +1091,7 @@ def create_app(
                 if rag_provider is None:
                     raise DemoConfigurationError("RAG provider is not configured")
                 with rag_provider(context) as service:
-                    if uses_gold_policy_evidence(request.question):
-                        document = service.answer_verified_extractive_evidence(
-                            demo_retrieval_query(request.question),
-                            document_id=GOLD_POLICY_DOCUMENT_ID,
-                            document_version_id=GOLD_POLICY_DOCUMENT_VERSION_ID,
-                            parent_chunk_id=GOLD_POLICY_PARENT_CHUNK_ID,
-                            child_chunk_id=GOLD_POLICY_CHILD_CHUNK_ID,
-                        )
-                    else:
-                        document = service.ask(demo_retrieval_query(request.question))
+                    document = service.ask(request.question)
         except AuthorizationDenied as error:
             with audit_provider(context) as audit:
                 audit.record_demo_query(
@@ -1009,9 +1111,12 @@ def create_app(
         except (
             DemoConfigurationError,
             DemoQueryError,
+            EmbeddingError,
             GenerationError,
+            RerankingError,
             SemanticDemoError,
         ) as error:
+            duration_ms = (time.perf_counter() - started) * 1000
             with audit_provider(context) as audit:
                 audit.record_demo_query(
                     question=request.question,
@@ -1021,13 +1126,25 @@ def create_app(
                     row_count=0,
                     citation_ids=(),
                     rejection_reason=type(error).__name__,
-                    response_status="ERROR",
-                    duration_ms=(time.perf_counter() - started) * 1000,
+                    response_status="REVIEW_REQUIRED",
+                    duration_ms=duration_ms,
                 )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="controlled demo query could not be completed",
-            ) from error
+            return DemoAnswer(
+                answer=(
+                    "No specific case context or verified evidence could be loaded for "
+                    "this question. No factual answer has been inferred. Open a case or "
+                    "identify an authorized indexed document or operational subject, then "
+                    "retry when the local services are ready."
+                ),
+                route=route,
+                principal=demo_principal(context),
+                warnings=(
+                    "NO_VERIFIED_EVIDENCE_RETURNED",
+                ),
+                review_required=True,
+                correlation_id=get_request_id(),
+                duration_ms=duration_ms,
+            )
         citation_ids = tuple(source.source_id for source in document.sources) if document else ()
         database_objects = structured.database_objects if structured else ()
         row_count = structured.row_count if structured else 0
@@ -1466,7 +1583,11 @@ def create_runtime_app() -> FastAPI:
         demo_provider = PostgresDemoStructuredProvider(settings)
         semantic_provider = PostgresSemanticDemoProvider(engine, settings)
     if settings.local_password_auth_enabled:
-        local_auth_service = LocalAuthService.from_settings(settings)
+        local_auth_service = (
+            LocalAuthService.from_database(engine, ttl_minutes=settings.local_auth_token_ttl_minutes)
+            if settings.pms_auth_mode == "local_database_demo"
+            else LocalAuthService.from_settings(settings)
+        )
     return create_app(
         PostgresServiceProvider(engine, settings),
         document_provider,

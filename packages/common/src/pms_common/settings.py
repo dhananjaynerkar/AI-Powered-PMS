@@ -114,6 +114,8 @@ class Settings(BaseSettings):
     pms_demo_max_rows: int = Field(default=10, ge=1, le=20)
     pms_demo_statement_timeout_seconds: int = Field(default=5, ge=1, le=15)
     local_password_auth_enabled: bool = False
+    pms_auth_mode: Literal["environment", "local_database_demo"] = "environment"
+    pms_business_schema: str = "public"
     local_auth_token_ttl_minutes: int = Field(default=60, ge=5, le=120)
     local_auth_data_entry_operator_username: str | None = None
     local_auth_data_entry_operator_password_hash: SecretStr | None = None
@@ -241,8 +243,8 @@ class Settings(BaseSettings):
     llm_provider: Literal["ollama"] = "ollama"
     ollama_base_url: str = "http://127.0.0.1:11434"
     llm_primary_model: str = "qwen3.5:4b"
-    llm_fallback_model: str = "qwen3.5:9b"
-    llm_allow_fallback: bool = True
+    llm_fallback_model: str = "qwen3.5:4b"
+    llm_allow_fallback: bool = False
     llm_thinking_enabled: bool = False
     llm_temperature: float = Field(default=0.1, ge=0, le=1)
     llm_top_p: float = Field(default=0.9, gt=0, le=1)
