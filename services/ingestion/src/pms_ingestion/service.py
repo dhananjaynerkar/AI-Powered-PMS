@@ -87,6 +87,13 @@ _STATUS_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
             DocumentStatus.DEACTIVATED,
         }
     ),
+    DocumentStatus.PROVISIONALLY_INDEXED: frozenset(
+        {
+            DocumentStatus.PARSING,
+            DocumentStatus.CHUNK_READY,
+            DocumentStatus.DEACTIVATED,
+        }
+    ),
     DocumentStatus.DEACTIVATED: frozenset(
         {
             DocumentStatus.PARSING,

@@ -805,6 +805,7 @@ function DocumentMetadataTable({ doc }: { doc: DocumentMetadata }) {
 }
 
 function AssistantPage({
+  accessToken,
   me,
   cases,
   timeline,
@@ -837,7 +838,7 @@ function AssistantPage({
     async function refreshRuntime() {
       try {
         const health = await loadRuntimeHealth<RuntimeHealth>();
-        const readiness = await loadRetrievalReadiness();
+        const readiness = await loadRetrievalReadiness(accessToken);
         if (!cancelled) {
           setRuntime(health);
           setRetrievalReadiness(readiness);
@@ -905,6 +906,7 @@ function AssistantPage({
 }
 
 interface AssistantProps {
+  accessToken: string;
   me: Me;
   cases: CaseRecord[];
   timeline: CaseTimeline | null;
@@ -1241,6 +1243,7 @@ function AppRuntime() {
   const currentMe = me;
 
   const assistantProps: AssistantProps = {
+    accessToken,
     me: currentMe,
     cases,
     timeline,

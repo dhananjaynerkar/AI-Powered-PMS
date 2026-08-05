@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     pdf_numeric_token_exact_match_required: bool = True
     pdf_citation_bbox_required: bool = True
     pdf_human_review_on_critical_failure: bool = True
+    pdf_provisional_indexing_enabled: bool = False
+    pdf_evidence_mode: Literal["AUTHORITATIVE_ONLY", "AUTHORITATIVE_AND_PROVISIONAL"] = (
+        "AUTHORITATIVE_ONLY"
+    )
     pdf_batch_size: int = Field(default=5, ge=1, le=100)
     pdf_max_retries: int = Field(default=2, ge=0, le=2)
     pdf_parse_timeout_seconds: int = Field(default=900, ge=30, le=3600)
@@ -611,6 +615,8 @@ class Settings(BaseSettings):
             "pdf_human_review_on_critical_failure": (
                 self.pdf_human_review_on_critical_failure
             ),
+            "pdf_provisional_indexing_enabled": self.pdf_provisional_indexing_enabled,
+            "pdf_evidence_mode": self.pdf_evidence_mode,
             "pdf_batch_size": self.pdf_batch_size,
             "pdf_max_retries": self.pdf_max_retries,
             "pdf_parse_timeout_seconds": self.pdf_parse_timeout_seconds,

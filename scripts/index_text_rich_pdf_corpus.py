@@ -169,6 +169,7 @@ def _process_one(
     tokenizer: BgeM3Tokenizer,
     embedder: BgeM3EmbeddingAdapter,
     retry_review_document_ids: frozenset[str] = frozenset(),
+    retry_conditional: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     path = INBOX / candidate.relative_path
@@ -210,10 +211,15 @@ def _process_one(
             uploaded.duplicate
             and metadata.status == DocumentStatus.REVIEW_REQUIRED.value
             and metadata.canonical_document_id not in retry_review_document_ids
+            and not retry_conditional
         ):
             result["outcome"] = "existing_review_required"
             return result
-        if uploaded.duplicate and metadata.status == DocumentStatus.INDEXED.value:
+        if (
+            uploaded.duplicate
+            and metadata.status == DocumentStatus.INDEXED.value
+            and metadata.canonical_document_id not in retry_review_document_ids
+        ):
             result["outcome"] = "already_indexed"
             return result
 
@@ -229,7 +235,13 @@ def _process_one(
         result["parser"] = parsed.parser
         result["parser_mode"] = parsed.parser_mode
         result["quality_issue_codes"] = list(parsed.issue_codes)
-        if not parsed.quality_passed or parsed.review_required:
+        result["quality_decision"] = parsed.quality_decision
+        provisional = (
+            parsed.quality_decision == "CONDITIONAL_PASS"
+            and settings.pdf_provisional_indexing_enabled
+            and settings.pdf_evidence_mode == "AUTHORITATIVE_AND_PROVISIONAL"
+        )
+        if not parsed.quality_passed or (parsed.review_required and not provisional):
             result["outcome"] = "review_required"
             return result
 
@@ -300,6 +312,19 @@ def main() -> int:
         default=[],
         help="Process only this inventory-relative PDF path; repeat for a batch.",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "Retry previously failed inventory candidates once; "
+            "review-required records are not retried."
+        ),
+    )
+    parser.add_argument(
+        "--retry-conditional",
+        action="store_true",
+        help="Re-evaluate prior review-required records and index only conditional passes.",
+    )
     arguments = parser.parse_args()
     if arguments.max_documents < 1 or arguments.max_documents > 100:
         raise SystemExit("--max-documents must be between 1 and 100")
@@ -327,6 +352,15 @@ def main() -> int:
         if item.checksum_sha256 not in prior
         or prior[item.checksum_sha256].get("canonical_document_id")
         in retry_review_document_ids
+        or (
+            arguments.retry_failed
+            and prior[item.checksum_sha256].get("outcome") == "failed"
+        )
+        or (
+            arguments.retry_conditional
+            and prior[item.checksum_sha256].get("outcome")
+            in {"review_required", "existing_review_required"}
+        )
     ]
     selected = remaining[: arguments.max_documents]
     if not selected:
@@ -349,6 +383,7 @@ def main() -> int:
                 tokenizer=tokenizer,
                 embedder=embedder,
                 retry_review_document_ids=retry_review_document_ids,
+                retry_conditional=arguments.retry_conditional,
             )
             prior[candidate.checksum_sha256] = record
             _write_results(prior.values())

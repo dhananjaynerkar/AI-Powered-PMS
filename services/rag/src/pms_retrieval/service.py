@@ -269,7 +269,13 @@ class RetrievalCoordinator:
                 if metadata.status == DocumentStatus.CHUNK_READY.value:
                     status = document_service.transition_status(
                         document_id,
-                        DocumentStatus.INDEXED,
+                        (
+                            DocumentStatus.PROVISIONALLY_INDEXED
+                            if self._settings.pdf_provisional_indexing_enabled
+                            and self._settings.pdf_evidence_mode
+                            == "AUTHORITATIVE_AND_PROVISIONAL"
+                            else DocumentStatus.INDEXED
+                        ),
                     ).status
         except Exception as error:
             self._fail_checkpoint(checkpoint_id, type(error).__name__)

@@ -31,6 +31,7 @@ class DocumentStatus(StrEnum):
     CANONICALIZED = "canonicalized"
     CHUNK_READY = "chunk_ready"
     INDEXED = "indexed"
+    PROVISIONALLY_INDEXED = "provisionally_indexed"
     DEACTIVATED = "deactivated"
     FAILED = "failed"
 

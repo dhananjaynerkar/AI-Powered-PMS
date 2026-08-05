@@ -69,7 +69,12 @@ class StructureAwareChunker:
         *,
         classification: str,
     ) -> tuple[DocumentChunk, ...]:
-        if canonical.quality.review_required or not canonical.quality.passed:
+        provisional = (
+            canonical.quality.decision == "CONDITIONAL_PASS"
+            and self._settings.pdf_provisional_indexing_enabled
+            and self._settings.pdf_evidence_mode == "AUTHORITATIVE_AND_PROVISIONAL"
+        )
+        if (canonical.quality.review_required and not provisional) or not canonical.quality.passed:
             raise ChunkingReviewRequired(
                 "only quality-passed canonical documents may be chunked"
             )

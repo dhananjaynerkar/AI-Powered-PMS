@@ -41,6 +41,7 @@ class PersistedParsingResult:
     canonical_object_key: str | None
     issue_codes: tuple[str, ...]
     final_status: str
+    quality_decision: str = "HARD_FAIL"
 
 
 def default_parsing_engine(settings: Settings) -> ParsingEngine:
@@ -213,6 +214,7 @@ class DocumentParsingCoordinator:
                         else "canonicalized"
                     )
                 ),
+                quality_decision=quality.decision,
             )
         if outcome is None or outcome.quality is None:
             return PersistedParsingResult(

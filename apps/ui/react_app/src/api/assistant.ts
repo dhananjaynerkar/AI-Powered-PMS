@@ -28,6 +28,6 @@ export function runDemoQuery(question: string, limit = 5): Promise<DemoAnswer> {
   });
 }
 
-export function loadRetrievalReadiness(): Promise<RetrievalReadiness> {
-  return requestJson<RetrievalReadiness>("/retrieval/readiness", "");
+export function loadRetrievalReadiness(accessToken: string): Promise<RetrievalReadiness> {
+  return requestJson<RetrievalReadiness>("/retrieval/readiness", accessToken);
 }

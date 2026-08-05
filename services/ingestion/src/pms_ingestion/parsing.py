@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pms_common.settings import Settings
 from pydantic import BaseModel, ConfigDict, Field
@@ -154,6 +154,19 @@ class QualityReport(BaseModel):
     review_required: bool
     metrics: QualityMetrics
     issues: tuple[QualityIssue, ...]
+
+    @property
+    def decision(self) -> Literal["PASS", "CONDITIONAL_PASS", "HARD_FAIL"]:
+        """Expose the three-way gate without weakening the existing booleans."""
+
+        if any(
+            issue.severity in {IssueSeverity.ERROR, IssueSeverity.CRITICAL}
+            for issue in self.issues
+        ):
+            return "HARD_FAIL"
+        if self.review_required or self.issues:
+            return "CONDITIONAL_PASS"
+        return "PASS"
 
 
 class CanonicalBlock(BaseModel):

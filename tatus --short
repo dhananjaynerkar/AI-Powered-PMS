@@ -1,0 +1,349 @@
+warning: in the working copy of '.env.example', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/ui/react_app/src/App.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/ui/react_app/src/api/assistant.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'packages/common/src/pms_common/settings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'scripts/index_text_rich_pdf_corpus.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ingestion/src/pms_ingestion/models.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ingestion/src/pms_ingestion/parsing.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ingestion/src/pms_ingestion/parsing_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ingestion/src/pms_ingestion/service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/rag/src/pms_retrieval/chunking.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/rag/src/pms_retrieval/rag.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/rag/src/pms_retrieval/service.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/.env.example b/.env.example[m
+[1mindex d036dfe..551d1eb 100644[m
+[1m--- a/.env.example[m
+[1m+++ b/.env.example[m
+[36m@@ -169,6 +169,8 @@[m [mPDF_MAX_UNEXPECTED_BLANK_PAGE_RATIO=0.02[m
+ PDF_NUMERIC_TOKEN_EXACT_MATCH_REQUIRED=true[m
+ PDF_CITATION_BBOX_REQUIRED=true[m
+ PDF_HUMAN_REVIEW_ON_CRITICAL_FAILURE=true[m
+[32m+[m[32mPDF_PROVISIONAL_INDEXING_ENABLED=false[m
+[32m+[m[32mPDF_EVIDENCE_MODE=AUTHORITATIVE_ONLY[m
+ PDF_BATCH_SIZE=5[m
+ PDF_MAX_RETRIES=2[m
+ PDF_PARSE_TIMEOUT_SECONDS=900[m
+[1mdiff --git a/apps/ui/react_app/src/App.tsx b/apps/ui/react_app/src/App.tsx[m
+[1mindex 7829cec..d210d47 100644[m
+[1m--- a/apps/ui/react_app/src/App.tsx[m
+[1m+++ b/apps/ui/react_app/src/App.tsx[m
+[36m@@ -805,6 +805,7 @@[m [mfunction DocumentMetadataTable({ doc }: { doc: DocumentMetadata }) {[m
+ }[m
+ [m
+ function AssistantPage({[m
+[32m+[m[32m  accessToken,[m
+   me,[m
+   cases,[m
+   timeline,[m
+[36m@@ -837,7 +838,7 @@[m [mfunction AssistantPage({[m
+     async function refreshRuntime() {[m
+       try {[m
+         const health = await loadRuntimeHealth<RuntimeHealth>();[m
+[31m-        const readiness = await loadRetrievalReadiness();[m
+[32m+[m[32m        const readiness = await loadRetrievalReadiness(accessToken);[m
+         if (!cancelled) {[m
+           setRuntime(health);[m
+           setRetrievalReadiness(readiness);[m
+[36m@@ -905,6 +906,7 @@[m [mfunction AssistantPage({[m
+ }[m
+ [m
+ interface AssistantProps {[m
+[32m+[m[32m  accessToken: string;[m
+   me: Me;[m
+   cases: CaseRecord[];[m
+   timeline: CaseTimeline | null;[m
+[36m@@ -1241,6 +1243,7 @@[m [mfunction AppRuntime() {[m
+   const currentMe = me;[m
+ [m
+   const assistantProps: AssistantProps = {[m
+[32m+[m[32m    accessToken,[m
+     me: currentMe,[m
+     cases,[m
+     timeline,[m
+[1mdiff --git a/apps/ui/react_app/src/api/assistant.ts b/apps/ui/react_app/src/api/assistant.ts[m
+[1mindex 1d6f2d3..1964c5a 100644[m
+[1m--- a/apps/ui/react_app/src/api/assistant.ts[m
+[1m+++ b/apps/ui/react_app/src/api/assistant.ts[m
+[36m@@ -28,6 +28,6 @@[m [mexport function runDemoQuery(question: string, limit = 5): Promise<DemoAnswer> {[m
+   });[m
+ }[m
+ [m
+[31m-export function loadRetrievalReadiness(): Promise<RetrievalReadiness> {[m
+[31m-  return requestJson<RetrievalReadiness>("/retrieval/readiness", "");[m
+[32m+[m[32mexport function loadRetrievalReadiness(accessToken: string): Promise<RetrievalReadiness> {[m
+[32m+[m[32m  return requestJson<RetrievalReadiness>("/retrieval/readiness", accessToken);[m
+ }[m
+[1mdiff --git a/packages/common/src/pms_common/settings.py b/packages/common/src/pms_common/settings.py[m
+[1mindex 596886b..32b4b53 100644[m
+[1m--- a/packages/common/src/pms_common/settings.py[m
+[1m+++ b/packages/common/src/pms_common/settings.py[m
+[36m@@ -179,6 +179,10 @@[m [mclass Settings(BaseSettings):[m
+     pdf_numeric_token_exact_match_required: bool = True[m
+     pdf_citation_bbox_required: bool = True[m
+     pdf_human_review_on_critical_failure: bool = True[m
+[32m+[m[32m    pdf_provisional_indexing_enabled: bool = False[m
+[32m+[m[32m    pdf_evidence_mode: Literal["AUTHORITATIVE_ONLY", "AUTHORITATIVE_AND_PROVISIONAL"] = ([m
+[32m+[m[32m        "AUTHORITATIVE_ONLY"[m
+[32m+[m[32m    )[m
+     pdf_batch_size: int = Field(default=5, ge=1, le=100)[m
+     pdf_max_retries: int = Field(default=2, ge=0, le=2)[m
+     pdf_parse_timeout_seconds: int = Field(default=900, ge=30, le=3600)[m
+[36m@@ -611,6 +615,8 @@[m [mclass Settings(BaseSettings):[m
+             "pdf_human_review_on_critical_failure": ([m
+                 self.pdf_human_review_on_critical_failure[m
+             ),[m
+[32m+[m[32m            "pdf_provisional_indexing_enabled": self.pdf_provisional_indexing_enabled,[m
+[32m+[m[32m            "pdf_evidence_mode": self.pdf_evidence_mode,[m
+             "pdf_batch_size": self.pdf_batch_size,[m
+             "pdf_max_retries": self.pdf_max_retries,[m
+             "pdf_parse_timeout_seconds": self.pdf_parse_timeout_seconds,[m
+[1mdiff --git a/scripts/index_text_rich_pdf_corpus.py b/scripts/index_text_rich_pdf_corpus.py[m
+[1mindex 9f244d6..4d0ece3 100644[m
+[1m--- a/scripts/index_text_rich_pdf_corpus.py[m
+[1m+++ b/scripts/index_text_rich_pdf_corpus.py[m
+[36m@@ -169,6 +169,7 @@[m [mdef _process_one([m
+     tokenizer: BgeM3Tokenizer,[m
+     embedder: BgeM3EmbeddingAdapter,[m
+     retry_review_document_ids: frozenset[str] = frozenset(),[m
+[32m+[m[32m    retry_conditional: bool = False,[m
+ ) -> dict[str, Any]:[m
+     started = time.monotonic()[m
+     path = INBOX / candidate.relative_path[m
+[36m@@ -210,10 +211,15 @@[m [mdef _process_one([m
+             uploaded.duplicate[m
+             and metadata.status == DocumentStatus.REVIEW_REQUIRED.value[m
+             and metadata.canonical_document_id not in retry_review_document_ids[m
+[32m+[m[32m            and not retry_conditional[m
+         ):[m
+             result["outcome"] = "existing_review_required"[m
+             return result[m
+[31m-        if uploaded.duplicate and metadata.status == DocumentStatus.INDEXED.value:[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            uploaded.duplicate[m
+[32m+[m[32m            and metadata.status == DocumentStatus.INDEXED.value[m
+[32m+[m[32m            and metadata.canonical_document_id not in retry_review_document_ids[m
+[32m+[m[32m        ):[m
+             result["outcome"] = "already_indexed"[m
+             return result[m
+ [m
+[36m@@ -229,7 +235,13 @@[m [mdef _process_one([m
+         result["parser"] = parsed.parser[m
+         result["parser_mode"] = parsed.parser_mode[m
+         result["quality_issue_codes"] = list(parsed.issue_codes)[m
+[31m-        if not parsed.quality_passed or parsed.review_required:[m
+[32m+[m[32m        result["quality_decision"] = parsed.quality_decision[m
+[32m+[m[32m        provisional = ([m
+[32m+[m[32m            parsed.quality_decision == "CONDITIONAL_PASS"[m
+[32m+[m[32m            and settings.pdf_provisional_indexing_enabled[m
+[32m+[m[32m            and settings.pdf_evidence_mode == "AUTHORITATIVE_AND_PROVISIONAL"[m
+[32m+[m[32m        )[m
+[32m+[m[32m        if not parsed.quality_passed or (parsed.review_required and not provisional):[m
+             result["outcome"] = "review_required"[m
+             return result[m
+ [m
+[36m@@ -300,6 +312,19 @@[m [mdef main() -> int:[m
+         default=[],[m
+         help="Process only this inventory-relative PDF path; repeat for a batch.",[m
+     )[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--retry-failed",[m
+[32m+[m[32m        action="store_true",[m
+[32m+[m[32m        help=([m
+[32m+[m[32m            "Retry previously failed inventory candidates once; "[m
+[32m+[m[32m            "review-required records are not retried."[m
+[32m+[m[32m        ),[m
+[32m+[m[32m    )[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--retry-conditional",[m
+[32m+[m[32m        action="store_true",[m
+[32m+[m[32m        help="Re-evaluate prior review-required records and index only conditional passes.",[m
+[32m+[m[32m    )[m
+     arguments = parser.parse_args()[m
+     if arguments.max_documents < 1 or arguments.max_documents > 100:[m
+         raise SystemExit("--max-documents must be between 1 and 100")[m
+[36m@@ -327,6 +352,15 @@[m [mdef main() -> int:[m
+         if item.checksum_sha256 not in prior[m
+         or prior[item.checksum_sha256].get("canonical_document_id")[m
+         in retry_review_document_ids[m
+[32m+[m[32m        or ([m
+[32m+[m[32m            arguments.retry_failed[m
+[32m+[m[32m            and prior[item.checksum_sha256].get("outcome") == "failed"[m
+[32m+[m[32m        )[m
+[32m+[m[32m        or ([m
+[32m+[m[32m            arguments.retry_conditional[m
+[32m+[m[32m            and prior[item.checksum_sha256].get("outcome")[m
+[32m+[m[32m            in {"review_required", "existing_review_required"}[m
+[32m+[m[32m        )[m
+     ][m
+     selected = remaining[: arguments.max_documents][m
+     if not selected:[m
+[36m@@ -349,6 +383,7 @@[m [mdef main() -> int:[m
+                 tokenizer=tokenizer,[m
+                 embedder=embedder,[m
+                 retry_review_document_ids=retry_review_document_ids,[m
+[32m+[m[32m                retry_conditional=arguments.retry_conditional,[m
+             )[m
+             prior[candidate.checksum_sha256] = record[m
+             _write_results(prior.values())[m
+[1mdiff --git a/services/ingestion/src/pms_ingestion/models.py b/services/ingestion/src/pms_ingestion/models.py[m
+[1mindex 0fbb5f6..1d3b753 100644[m
+[1m--- a/services/ingestion/src/pms_ingestion/models.py[m
+[1m+++ b/services/ingestion/src/pms_ingestion/models.py[m
+[36m@@ -31,6 +31,7 @@[m [mclass DocumentStatus(StrEnum):[m
+     CANONICALIZED = "canonicalized"[m
+     CHUNK_READY = "chunk_ready"[m
+     INDEXED = "indexed"[m
+[32m+[m[32m    PROVISIONALLY_INDEXED = "provisionally_indexed"[m
+     DEACTIVATED = "deactivated"[m
+     FAILED = "failed"[m
+ [m
+[1mdiff --git a/services/ingestion/src/pms_ingestion/parsing.py b/services/ingestion/src/pms_ingestion/parsing.py[m
+[1mindex 3c33b95..ec5c336 100644[m
+[1m--- a/services/ingestion/src/pms_ingestion/parsing.py[m
+[1m+++ b/services/ingestion/src/pms_ingestion/parsing.py[m
+[36m@@ -6,7 +6,7 @@[m [mimport re[m
+ from collections.abc import Callable, Sequence[m
+ from datetime import UTC, datetime[m
+ from enum import StrEnum[m
+[31m-from typing import Protocol[m
+[32m+[m[32mfrom typing import Literal, Protocol[m
+ [m
+ from pms_common.settings import Settings[m
+ from pydantic import BaseModel, ConfigDict, Field[m
+[36m@@ -155,6 +155,19 @@[m [mclass QualityReport(BaseModel):[m
+     metrics: QualityMetrics[m
+     issues: tuple[QualityIssue, ...][m
+ [m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def decision(self) -> Literal["PASS", "CONDITIONAL_PASS", "HARD_FAIL"]:[m
+[32m+[m[32m        """Expose the three-way gate without weakening the existing booleans."""[m
+[32m+[m
+[32m+[m[32m        if any([m
+[32m+[m[32m            issue.severity in {IssueSeverity.ERROR, IssueSeverity.CRITICAL}[m
+[32m+[m[32m            for issue in self.issues[m
+[32m+[m[32m        ):[m
+[32m+[m[32m            return "HARD_FAIL"[m
+[32m+[m[32m        if self.review_required or self.issues:[m
+[32m+[m[32m            return "CONDITIONAL_PASS"[m
+[32m+[m[32m        return "PASS"[m
+[32m+[m
+ [m
+ class CanonicalBlock(BaseModel):[m
+     model_config = ConfigDict(extra="forbid", frozen=True)[m
+[1mdiff --git a/services/ingestion/src/pms_ingestion/parsing_service.py b/services/ingestion/src/pms_ingestion/parsing_service.py[m
+[1mindex 7a8c0aa..f4645d5 100644[m
+[1m--- a/services/ingestion/src/pms_ingestion/parsing_service.py[m
+[1m+++ b/services/ingestion/src/pms_ingestion/parsing_service.py[m
+[36m@@ -41,6 +41,7 @@[m [mclass PersistedParsingResult:[m
+     canonical_object_key: str | None[m
+     issue_codes: tuple[str, ...][m
+     final_status: str[m
+[32m+[m[32m    quality_decision: str = "HARD_FAIL"[m
+ [m
+ [m
+ def default_parsing_engine(settings: Settings) -> ParsingEngine:[m
+[36m@@ -213,6 +214,7 @@[m [mclass DocumentParsingCoordinator:[m
+                         else "canonicalized"[m
+                     )[m
+                 ),[m
+[32m+[m[32m                quality_decision=quality.decision,[m
+             )[m
+         if outcome is None or outcome.quality is None:[m
+             return PersistedParsingResult([m
+[1mdiff --git a/services/ingestion/src/pms_ingestion/service.py b/services/ingestion/src/pms_ingestion/service.py[m
+[1mindex 4d16557..9cc2bb6 100644[m
+[1m--- a/services/ingestion/src/pms_ingestion/service.py[m
+[1m+++ b/services/ingestion/src/pms_ingestion/service.py[m
+[36m@@ -87,6 +87,13 @@[m [m_STATUS_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {[m
+             DocumentStatus.DEACTIVATED,[m
+         }[m
+     ),[m
+[32m+[m[32m    DocumentStatus.PROVISIONALLY_INDEXED: frozenset([m
+[32m+[m[32m        {[m
+[32m+[m[32m            DocumentStatus.PARSING,[m
+[32m+[m[32m            DocumentStatus.CHUNK_READY,[m
+[32m+[m[32m            DocumentStatus.DEACTIVATED,[m
+[32m+[m[32m        }[m
+[32m+[m[32m    ),[m
+     DocumentStatus.DEACTIVATED: frozenset([m
+         {[m
+             DocumentStatus.PARSING,[m
+[1mdiff --git a/services/rag/src/pms_retrieval/chunking.py b/services/rag/src/pms_retrieval/chunking.py[m
+[1mindex 3c3bf0b..b27a84e 100644[m
+[1m--- a/services/rag/src/pms_retrieval/chunking.py[m
+[1m+++ b/services/rag/src/pms_retrieval/chunking.py[m
+[36m@@ -69,7 +69,12 @@[m [mclass StructureAwareChunker:[m
+         *,[m
+         classification: str,[m
+     ) -> tuple[DocumentChunk, ...]:[m
+[31m-        if canonical.quality.review_required or not canonical.quality.passed:[m
+[32m+[m[32m        provisional = ([m
+[32m+[m[32m            canonical.quality.decision == "CONDITIONAL_PASS"[m
+[32m+[m[32m            and self._settings.pdf_provisional_indexing_enabled[m
+[32m+[m[32m            and self._settings.pdf_evidence_mode == "AUTHORITATIVE_AND_PROVISIONAL"[m
+[32m+[m[32m        )[m
+[32m+[m[32m        if (canonical.quality.review_required and not provisional) or not canonical.quality.passed:[m
+             raise ChunkingReviewRequired([m
+                 "only quality-passed canonical documents may be chunked"[m
+             )[m
+[1mdiff --git a/services/rag/src/pms_retrieval/rag.py b/services/rag/src/pms_retrieval/rag.py[m
+[1mindex 684d3ba..d260518 100644[m
+[1m--- a/services/rag/src/pms_retrieval/rag.py[m
+[1m+++ b/services/rag/src/pms_retrieval/rag.py[m
+[36m@@ -41,7 +41,6 @@[m [mfrom pms_retrieval.models import ([m
+     SourceCitation,[m
+ )[m
+ from pms_retrieval.query import ([m
+[31m-    document_pattern,[m
+     lexical_search_query,[m
+     reciprocal_rank_fusion,[m
+     understand_query,[m
+[36m@@ -251,8 +250,6 @@[m [mclass HybridRagService:[m
+             response_language=response_language,[m
+             maximum_length=self._settings.query_max_length,[m
+         )[m
+[31m-        pattern = document_pattern(understanding.document_type)[m
+[31m-[m
+         stage = time.perf_counter()[m
+         lexical_query = lexical_search_query([m
+             understanding.normalized_query,[m
+[36m@@ -262,9 +259,9 @@[m [mclass HybridRagService:[m
+             lexical_query,[m
+             self._settings.lexical_top_k,[m
+             as_of_date=understanding.as_of_date,[m
+[31m-            document_pattern=pattern,[m
+[32m+[m[32m            document_pattern=None,[m
+         )[m
+[31m-        if not lexical and pattern is not None:[m
+[32m+[m[32m        if not lexical:[m
+             lexical = self._repository.lexical_search([m
+                 lexical_query,[m
+                 self._settings.lexical_top_k,[m
+[36m@@ -294,7 +291,7 @@[m [mclass HybridRagService:[m
+                 revision=self._embedder.revision,[m
+                 limit=self._settings.dense_top_k,[m
+                 as_of_date=understanding.as_of_date,[m
+[31m-                document_pattern=pattern,[m
+[32m+[m[32m                document_pattern=None,[m
+             )[m
+             durations["dense"] = _elapsed_ms(stage)[m
+             stage = time.perf_counter()[m
+[1mdiff --git a/services/rag/src/pms_retrieval/service.py b/services/rag/src/pms_retrieval/service.py[m
+[1mindex a6179e4..cfe4ab7 100644[m
+[1m--- a/services/rag/src/pms_retrieval/service.py[m
+[1m+++ b/services/rag/src/pms_retrieval/service.py[m
+[36m@@ -269,7 +269,13 @@[m [mclass RetrievalCoordinator:[m
+                 if metadata.status == DocumentStatus.CHUNK_READY.value:[m
+                     status = document_service.transition_status([m
+                         document_id,[m
+[31m-                        DocumentStatus.INDEXED,[m
+[32m+[m[32m                        ([m
+[32m+[m[32m                            DocumentStatus.PROVISIONALLY_INDEXED[m
+[32m+[m[32m                            if self._settings.pdf_provisional_indexing_enabled[m
+[32m+[m[32m                            and self._settings.pdf_evidence_mode[m
+[32m+[m[32m                            == "AUTHORITATIVE_AND_PROVISIONAL"[m
+[32m+[m[32m                            else DocumentStatus.INDEXED[m
+[32m+[m[32m                        ),[m
+                     ).status[m
+         except Exception as error:[m
+             self._fail_checkpoint(checkpoint_id, type(error).__name__)[m

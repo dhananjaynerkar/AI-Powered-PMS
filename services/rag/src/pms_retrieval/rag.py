@@ -41,7 +41,6 @@ from pms_retrieval.models import (
     SourceCitation,
 )
 from pms_retrieval.query import (
-    document_pattern,
     lexical_search_query,
     reciprocal_rank_fusion,
     understand_query,
@@ -251,8 +250,6 @@ class HybridRagService:
             response_language=response_language,
             maximum_length=self._settings.query_max_length,
         )
-        pattern = document_pattern(understanding.document_type)
-
         stage = time.perf_counter()
         lexical_query = lexical_search_query(
             understanding.normalized_query,
@@ -262,9 +259,9 @@ class HybridRagService:
             lexical_query,
             self._settings.lexical_top_k,
             as_of_date=understanding.as_of_date,
-            document_pattern=pattern,
+            document_pattern=None,
         )
-        if not lexical and pattern is not None:
+        if not lexical:
             lexical = self._repository.lexical_search(
                 lexical_query,
                 self._settings.lexical_top_k,
@@ -294,7 +291,7 @@ class HybridRagService:
                 revision=self._embedder.revision,
                 limit=self._settings.dense_top_k,
                 as_of_date=understanding.as_of_date,
-                document_pattern=pattern,
+                document_pattern=None,
             )
             durations["dense"] = _elapsed_ms(stage)
             stage = time.perf_counter()
