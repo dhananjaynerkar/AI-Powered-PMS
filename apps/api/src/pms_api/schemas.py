@@ -5,6 +5,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+from pms_case_workflow.chat_models import (
+    ChatMessageRole,
+    ChatMessageStatus,
+    ChatStatus,
+    ChatType,
+)
 from pms_case_workflow.models import CaseState
 from pms_common.security import Classification, UserRole
 from pms_ingestion.models import DocumentMetadata
@@ -44,8 +50,110 @@ class HandoffRequest(BaseModel):
     remarks: str = Field(min_length=1, max_length=4000)
 
 
+class StaffRecipientResponse(BaseModel):
+    """Safe recipient fields that may be displayed in the handoff selector."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    subject: str
+    display_name: str
+    username: str
+    designation: str | None
+    role: UserRole
+
+
 class RemarksRequest(BaseModel):
     remarks: str = Field(min_length=1, max_length=4000)
+
+
+class CreateChatRequest(BaseModel):
+    """Create a blank persisted chat; the first-question title is deterministic."""
+
+    title: str = Field(default="New Chat", min_length=1, max_length=300)
+    chat_type: ChatType = ChatType.PERSONAL
+    case_id: str | None = Field(default=None, max_length=200)
+
+
+class UpdateChatRequest(BaseModel):
+    """Rename/archive a chat without destructive deletion."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    status: ChatStatus | None = None
+    first_question: str | None = Field(default=None, min_length=1, max_length=4000)
+
+
+class ChatSummaryResponse(BaseModel):
+    chat_id: str
+    title: str
+    chat_type: ChatType
+    status: ChatStatus
+    owner_subject: str
+    case_id: str | None
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None
+
+
+class ChatCitationResponse(BaseModel):
+    citation_id: str
+    message_id: str
+    source_id: str
+    canonical_document_id: str
+    document_version_id: str | None
+    page_number: int
+    block_id: str | None
+    section_number: str | None
+    clause_number: str | None
+    bounding_box: dict[str, Any] | None
+    created_at: datetime
+
+
+class ChatMessageResponse(BaseModel):
+    message_id: str
+    chat_id: str
+    sequence_number: int
+    sender_subject: str
+    message_role: ChatMessageRole
+    content: str
+    message_status: ChatMessageStatus
+    model_name: str | None
+    route: str | None
+    review_required: bool
+    created_at: datetime
+    completed_at: datetime | None
+    failure_reason: str | None
+    citations: tuple[ChatCitationResponse, ...] = ()
+
+
+class ChatAttachmentResponse(BaseModel):
+    attachment_id: str
+    chat_id: str
+    uploaded_by_subject: str
+    canonical_document_id: str | None
+    original_filename: str
+    checksum_sha256: str
+    mime_type: str
+    size_bytes: int
+    ingestion_status: str
+    classification: Classification
+    created_at: datetime
+    ready_at: datetime | None
+    failure_reason: str | None
+    review_reason: str | None
+
+
+class ChatMemoryResponse(BaseModel):
+    chat_id: str
+    summary: str
+    last_summarized_sequence: int
+    summary_version: int
+    updated_at: datetime
+
+
+class ChatResponse(ChatSummaryResponse):
+    messages: tuple[ChatMessageResponse, ...] = ()
+    attachments: tuple[ChatAttachmentResponse, ...] = ()
+    memory: ChatMemoryResponse | None = None
 
 
 class CaseResponse(BaseModel):
@@ -217,6 +325,7 @@ class MeResponse(BaseModel):
 
 class PolicyQueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
+    chat_id: str | None = Field(default=None, max_length=200)
     response_language: ResponseLanguage = ResponseLanguage.AUTO
     as_of_date: date | None = None
     include_trace: bool = False

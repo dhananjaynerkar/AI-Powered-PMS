@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Literal, Protocol
 
 from pms_common.settings import Settings
+from pms_common.text import remove_nul_characters
 from pydantic import BaseModel, ConfigDict, Field
 
 from pms_ingestion.models import DocumentMetadata
@@ -215,6 +216,8 @@ class CanonicalDocument(BaseModel):
     parsed_at: datetime
     pages: tuple[CanonicalPage, ...]
     quality: QualityReport
+    normalization_codes: tuple[str, ...] = ()
+    nul_characters_removed: int = Field(default=0, ge=0)
 
 
 class ParserAttempt(BaseModel):
@@ -577,13 +580,16 @@ def build_canonical_document(
     """Project vendor output into the stable canonical schema."""
 
     canonical_pages: list[CanonicalPage] = []
+    nul_characters_removed = 0
     for page in output.pages:
         canonical_blocks: list[CanonicalBlock] = []
         for block in sorted(page.blocks, key=lambda item: item.reading_order):
-            language_code, languages, script_code = _language_metadata(block.text)
+            sanitized_text = remove_nul_characters(block.text) or ""
+            nul_characters_removed += block.text.count("\x00")
+            language_code, languages, script_code = _language_metadata(sanitized_text)
             canonical_blocks.append(
                 CanonicalBlock(
-                    **block.model_dump(),
+                    **block.model_copy(update={"text": sanitized_text}).model_dump(),
                     language_code=language_code,
                     languages=languages,
                     script_code=script_code,
@@ -614,6 +620,10 @@ def build_canonical_document(
         parsed_at=parsed_at or datetime.now(UTC),
         pages=tuple(canonical_pages),
         quality=quality,
+        normalization_codes=(
+            ("NUL_CHARACTERS_REMOVED",) if nul_characters_removed else ()
+        ),
+        nul_characters_removed=nul_characters_removed,
     )
 
 

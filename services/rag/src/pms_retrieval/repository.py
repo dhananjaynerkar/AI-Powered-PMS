@@ -17,6 +17,11 @@ from pms_common.security import (
     create_audit_event,
     write_audit_event,
 )
+from pms_common.text import (
+    assert_no_nul_characters,
+    remove_nul_characters,
+    sanitize_nested_strings,
+)
 from sqlalchemy import Connection, bindparam, text
 
 from pms_retrieval.models import (
@@ -196,6 +201,12 @@ class PostgresChunkRepository:
         )
 
     def _insert_chunk(self, chunk: DocumentChunk) -> None:
+        safe_text = remove_nul_characters(chunk.text) or ""
+        safe_heading = sanitize_nested_strings(chunk.heading_path)
+        safe_boxes = sanitize_nested_strings(
+            [citation.model_dump(mode="json") for citation in chunk.citations]
+        )
+        assert_no_nul_characters((safe_text, safe_heading, safe_boxes))
         self._connection.execute(
             text(
                 """
@@ -232,14 +243,12 @@ class PostgresChunkRepository:
                 "parent_chunk_id": chunk.parent_chunk_id,
                 "chunk_kind": chunk.chunk_kind.value,
                 "ordinal": chunk.ordinal,
-                "text": chunk.text,
+                "text": safe_text,
                 "token_count": chunk.token_count,
                 "content_hash": chunk.content_hash,
-                "heading_path": json.dumps(chunk.heading_path),
+                "heading_path": json.dumps(safe_heading),
                 "page_numbers": list(chunk.page_numbers),
-                "bounding_boxes": json.dumps(
-                    [citation.model_dump(mode="json") for citation in chunk.citations]
-                ),
+                "bounding_boxes": json.dumps(safe_boxes),
                 "section_number": chunk.section_number,
                 "clause_number": chunk.clause_number,
                 "language_code": chunk.language_code,

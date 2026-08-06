@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 from pms_api.app import create_app, get_authorization_context
+from pms_api.staff_directory import StaffRecipient
 from pms_case_workflow.service import CaseWorkflowService
 from pms_common.security import AuthorizationContext, Classification, UserRole
 
@@ -42,7 +43,30 @@ def test_required_case_api_flow_and_guessed_id_denial() -> None:
         token = request.headers["authorization"].removeprefix("Bearer ")
         return identities[token]
 
-    app = create_app(provider)
+    class Directory:
+        def recipients(
+            self,
+            context: AuthorizationContext,
+            *,
+            role: UserRole,
+        ) -> tuple[StaffRecipient, ...]:
+            del context
+            if role is UserRole.NODAL_REGIONAL_OFFICER:
+                return (StaffRecipient("no-1", "NO One", "no-1", None, role),)
+            return ()
+
+        def require_recipient(
+            self,
+            context: AuthorizationContext,
+            *,
+            role: UserRole,
+            subject: str,
+        ) -> StaffRecipient:
+            if subject != "no-1":
+                raise ValueError("unknown test recipient")
+            return self.recipients(context, role=role)[0]
+
+    app = create_app(provider, staff_directory=Directory())
     app.dependency_overrides[get_authorization_context] = fake_context
 
     async def scenario() -> None:

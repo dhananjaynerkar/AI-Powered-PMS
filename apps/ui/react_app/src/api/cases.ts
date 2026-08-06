@@ -1,4 +1,4 @@
-import type { CaseMessage, CaseRecord, CaseTimeline } from "../types";
+import type { CaseMessage, CaseRecord, CaseTimeline, LocalLoginRole, StaffRecipient } from "../types";
 import { requestJson } from "./client";
 
 export function loadCaseQueue(accessToken: string): Promise<CaseRecord[]> {
@@ -34,10 +34,22 @@ export function createCase(
   });
 }
 
-export function submitToNo(caseId: string, accessToken: string): Promise<CaseRecord> {
+export function loadCaseRecipients(
+  role: LocalLoginRole,
+  accessToken: string
+): Promise<StaffRecipient[]> {
+  return requestJson<StaffRecipient[]>(`/case-recipients?role=${encodeURIComponent(role)}`, accessToken);
+}
+
+export function submitToNo(
+  caseId: string,
+  accessToken: string,
+  assignedSubject: string,
+  remarks: string
+): Promise<CaseRecord> {
   return requestJson<CaseRecord>(`/cases/${caseId}/submit-to-no`, accessToken, {
     method: "POST",
-    body: JSON.stringify({ assigned_subject: "demo.no", remarks: "Controlled local evidence package forwarded for NO review." })
+    body: JSON.stringify({ assigned_subject: assignedSubject, remarks })
   });
 }
 
@@ -48,9 +60,14 @@ export function verifyCase(caseId: string, accessToken: string): Promise<CaseRec
   });
 }
 
-export function submitToHod(caseId: string, accessToken: string): Promise<CaseRecord> {
+export function submitToHod(
+  caseId: string,
+  accessToken: string,
+  assignedSubject: string,
+  remarks: string
+): Promise<CaseRecord> {
   return requestJson<CaseRecord>(`/cases/${caseId}/submit-to-hod`, accessToken, {
     method: "POST",
-    body: JSON.stringify({ assigned_subject: "demo.hod", remarks: "NO forwarded the verified controlled evidence package to HOD." })
+    body: JSON.stringify({ assigned_subject: assignedSubject, remarks })
   });
 }

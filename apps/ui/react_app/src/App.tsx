@@ -6,16 +6,21 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState
 } from "react";
 
 import {
   ApiError,
   createCase,
+  createChat,
   endDemoSession,
   endLocalSession,
   loadAudit,
   loadCaseQueue,
+  loadChat,
+  loadChats,
+  loadCaseRecipients,
   loadDemoMe,
   loadDemoStatus,
   loadDocument,
@@ -25,8 +30,9 @@ import {
   loadRetrievalReadiness,
   loginLocally,
   postCaseMessage,
-  runDemoQuery,
+  updateChat,
   runPolicyQuery,
+  runPolicyQueryStream,
   runStructuredQuery,
   startDemoSession,
   submitToHod,
@@ -38,6 +44,8 @@ import type {
   AuditEvent,
   CaseRecord,
   CaseTimeline,
+  ChatResponse,
+  ChatSummary,
   DemoAnswer,
   DemoIdentity,
   DocumentMetadata,
@@ -47,6 +55,7 @@ import type {
   Me,
   RuntimeHealth,
   RetrievalReadiness,
+  StaffRecipient,
   StructuredAnswer
 } from "./types";
 import "./styles.css";
@@ -225,6 +234,31 @@ function errorMessage(reason: unknown): string {
   return "Request failed";
 }
 
+const ACTIVITY_STAGE_LABELS: Record<string, string> = {
+  reading_question: "Reading your question…",
+  retrieving_authorized_evidence: "Searching authorized records…",
+  searching_authorized_records: "Searching authorized records…",
+  searching_document_evidence: "Searching document evidence…",
+  reranking_evidence: "Reranking evidence…",
+  generating_answer: "Generating answer…",
+  validating_citations: "Validating citations…",
+  saving_response: "Saving response…"
+};
+
+function activityStageLabel(stage: string | null): string {
+  if (!stage) return ACTIVITY_STAGE_LABELS.reading_question;
+  return ACTIVITY_STAGE_LABELS[stage.trim().toLowerCase()] ?? ACTIVITY_STAGE_LABELS.reading_question;
+}
+
+function AssistantActivity({ stage, nearComposer = false }: { stage: string | null; nearComposer?: boolean }) {
+  return (
+    <div className={`assistant-activity${nearComposer ? " composer-activity" : ""}`} aria-live="polite" role="status">
+      <span className="activity-spinner" aria-hidden="true" />
+      <span>{activityStageLabel(stage)}</span>
+    </div>
+  );
+}
+
 function isDenied(reason: unknown): boolean {
   return reason instanceof ApiError && reason.status === 403;
 }
@@ -367,6 +401,7 @@ function PublicLogin({
 }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [role, setRole] = useState<LocalLoginRole>("Data Entry Operator");
   const { navigate } = useRouter();
 
@@ -401,9 +436,10 @@ function PublicLogin({
           <form className="login-form" onSubmit={submit}>
             <label>Role<select value={role} onChange={(event) => setRole(event.target.value as LocalLoginRole)}><option>Data Entry Operator</option><option>Nodal/Regional Officer</option><option>HOD</option><option>Tenant</option></select></label>
             <label>Username<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-            <label>Password<input autoComplete="current-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <label>Password<div className="password-control"><input autoComplete="current-password" type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} /><button aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} className="password-toggle" onClick={() => setShowPassword((visible) => !visible)} type="button">{showPassword ? "Hide" : "Show"}</button></div></label>
             <button className="primary-action" disabled={!localAuthAvailable} type="submit"><Icon name="lock" size={17} /> Sign in</button>
           </form>
+          <p className="login-note">Use the exact <code>demo_password</code> from this account row. The PostgreSQL administrator password is not an application login password.</p>
           {!localAuthAvailable && <p className="login-note">Local password authentication is not enabled in the configured backend.</p>}
         </div>
       </section>
@@ -718,6 +754,27 @@ function EvidencePanel({ answer }: { answer: GroundedAnswer }) {
   );
 }
 
+function documentAnswerForWorkspace(answer: GroundedAnswer, me: Me): DemoAnswer {
+  return {
+    answer: answer.answer,
+    route: "DOCUMENT_RAG",
+    principal: {
+      username: me.subject,
+      role: me.roles.join(", "),
+      department: me.department_id ?? "not recorded",
+      unit_id: me.unit_id ?? "not recorded",
+      classification: me.classification
+    },
+    structured: null,
+    document: answer,
+    warnings: answer.warnings,
+    review_required: answer.review_required,
+    correlation_id: "",
+    duration_ms: 0,
+    evidence_extracted: false
+  };
+}
+
 function DocumentsPage({ accessToken }: { accessToken: string }) {
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
@@ -808,13 +865,24 @@ function AssistantPage({
   accessToken,
   me,
   cases,
+  chats,
+  selectedChat,
+  selectedChatId,
   timeline,
   demoActive,
   demoAnswer,
   busy,
+  streamingStage,
+  requestError,
+  completionMessage,
   caseMessage,
   demoCaseMessage,
   selectCase,
+  selectChat,
+  createNewChat,
+  renameChat,
+  stopAssistantRequest,
+  retryLastQuestion,
   createDemoCase,
   sendMessage,
   sendDemoCaseMessage,
@@ -830,6 +898,7 @@ function AssistantPage({
 }: AssistantProps) {
   const { navigate } = useRouter();
   const [search, setSearch] = useState("");
+  const [chatSearch, setChatSearch] = useState("");
   const [runtime, setRuntime] = useState<RuntimeHealth | null>(null);
   const [retrievalReadiness, setRetrievalReadiness] = useState<RetrievalReadiness | null>(null);
   const [runtimeUnavailable, setRuntimeUnavailable] = useState(false);
@@ -854,16 +923,33 @@ function AssistantPage({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [accessToken]);
   useEffect(() => {
     if (selectedCaseId && timeline?.case.case_id !== selectedCaseId) void selectCase(selectedCaseId);
   }, [selectedCaseId, selectCase, timeline?.case.case_id]);
+  useEffect(() => {
+    if (selectedChatId && selectedChat?.chat_id !== selectedChatId) void selectChat(selectedChatId);
+  }, [selectedChat, selectedChatId, selectChat]);
   const visibleCases = cases.filter((item) => item.title.toLowerCase().includes(search.toLowerCase()) || item.case_id.toLowerCase().includes(search.toLowerCase()));
+  const visibleChats = chats.filter((item) => item.title.toLowerCase().includes(chatSearch.toLowerCase()));
   return (
     <>
       <PageHeader title="AI Assistant" subtitle="Large chat workspace with case context and evidence drawer." />
       <section className="assistant-layout">
         <aside className="assistant-left">
+          <button className="full-button" onClick={createNewChat} type="button"><Icon name="message" size={18} /> + New Chat</button>
+          <SearchInput label="Search chats" value={chatSearch} onChange={setChatSearch} />
+          <div className="case-list" aria-label="Saved chats">
+            {visibleChats.length === 0 ? <EmptyState title="No saved chats" text="Create a chat to persist your conversation." /> : visibleChats.map((item) => (
+              <button className={item.chat_id === selectedChatId ? "case-card active" : "case-card"} key={item.chat_id} onClick={() => selectChat(item.chat_id)} type="button">
+                <strong>{item.title}</strong><span>{item.chat_type === "SHARED_CASE" ? "Shared" : "Personal"}</span><small>{new Date(item.updated_at).toLocaleString()}</small>
+              </button>
+            ))}
+          </div>
+          {selectedChat && <button className="secondary-button" type="button" onClick={() => {
+            const title = window.prompt("Chat title", selectedChat.title)?.trim();
+            if (title) void renameChat(selectedChat.chat_id, title);
+          }}>Rename selected chat</button>}
           {!isTenant(me) && <button className="full-button" onClick={createDemoCase} type="button"><Icon name="message" size={18} /> New Case</button>}
           <SearchInput label="Search cases" value={search} onChange={setSearch} />
           <div className="case-list">
@@ -877,20 +963,25 @@ function AssistantPage({
         <section className="assistant-center">
           <div className="assistant-header"><StatusBadge>{runtimeUnavailable ? "Backend unavailable" : retrievalReadiness?.ready_for_questions ? "Ready" : "Not ready"}</StatusBadge><span>{retrievalReadiness ? `${retrievalReadiness.indexed_documents} indexed documents · ${retrievalReadiness.embedded_child_chunks} embedded chunks · ${retrievalReadiness.generation_model} ${retrievalReadiness.generation_model_state}` : runtime ? `Backend ${runtime.runtime_id} is checking retrieval readiness.` : "Connecting to the configured backend."}</span></div>
           <div className="chat-thread" aria-live="polite">
-            {!timeline && <EmptyState title="Open or create a case" text="The assistant can answer controlled questions without a case, but handoff evidence is attached only when a case is open." />}
+            {!timeline && !selectedChat && <EmptyState title="Open or create a case" text="The assistant can answer controlled questions without a case, but handoff evidence is attached only when a case is open." />}
+            {selectedChat?.messages.map((message) => <article className="assistant-bubble" key={message.message_id}><strong>{message.message_role}</strong><p>{message.content}</p><small>{new Date(message.created_at).toLocaleString()}</small></article>)}
             {timeline?.messages.map((message) => <article className="assistant-bubble" key={message.message_id}><strong>{message.author_role}</strong><p>{message.body}</p><small>{new Date(message.created_at).toLocaleString()}</small></article>)}
-            {demoAnswer && <article className="assistant-bubble result"><p>{demoAnswer.answer}</p>{demoAnswer.structured && <StructuredEvidence answer={demoAnswer} />}{demoAnswer.document && <EvidencePanel answer={demoAnswer.document} />}</article>}
+            {busy && <AssistantActivity stage={streamingStage} />}
+            {demoAnswer && <article className="assistant-bubble result">{demoAnswer.document ? <EvidencePanel answer={demoAnswer.document} /> : <p>{demoAnswer.answer}</p>}{demoAnswer.structured && <StructuredEvidence answer={demoAnswer} />}</article>}
+            {completionMessage && <p className="assistant-complete-status" role="status">{completionMessage}</p>}
+            {requestError && <div className="assistant-error" role="alert"><span>{requestError}</span><button type="button" onClick={retryLastQuestion}>Retry</button></div>}
           </div>
           <form className="chat-form" onSubmit={submitDemo}>
-            <textarea aria-label="Assistant question" value={demoQuestion} onChange={(event) => setDemoQuestion(event.target.value)} placeholder="Ask about authorized bills, leases, estates, plots, policies or cases." rows={2} />
-            <button type="submit"><Icon name="send" size={18} /> Send</button>
+            {busy && <AssistantActivity stage={streamingStage} nearComposer />}
+            <textarea aria-label="Assistant question" disabled={busy} value={demoQuestion} onChange={(event) => setDemoQuestion(event.target.value)} placeholder="Ask about authorized bills, leases, estates, plots, policies or cases." rows={2} />
+            {busy ? <button type="button" onClick={stopAssistantRequest}><Icon name="refresh" size={18} /> Stop</button> : <button type="submit"><Icon name="send" size={18} /> Send</button>}
           </form>
         </section>
         <aside className="assistant-right">
           <Panel title="Evidence and Context" icon="file">
             <ContextDrawer timeline={timeline} demoAnswer={demoAnswer} />
           </Panel>
-          {timeline && <WorkflowActions me={me} timeline={timeline} handoffToNo={handoffToNo} verifyByNo={verifyByNo} forwardToHod={forwardToHod} />}
+          {timeline && <WorkflowActions accessToken={accessToken} demoActive={demoActive} me={me} timeline={timeline} handoffToNo={handoffToNo} verifyByNo={verifyByNo} forwardToHod={forwardToHod} />}
           {timeline && (
             <Panel title="Case Observation" icon="message">
               <form className="message-form" onSubmit={demoActive ? sendDemoCaseMessage : sendMessage}>
@@ -909,6 +1000,9 @@ interface AssistantProps {
   accessToken: string;
   me: Me;
   cases: CaseRecord[];
+  chats: ChatSummary[];
+  selectedChat: ChatResponse | null;
+  selectedChatId?: string;
   timeline: CaseTimeline | null;
   demoActive: boolean;
   demoAnswer: DemoAnswer | null;
@@ -916,13 +1010,21 @@ interface AssistantProps {
   caseMessage: string;
   demoCaseMessage: string;
   demoQuestion: string;
+  streamingStage: string | null;
+  requestError: string | null;
+  completionMessage: string | null;
   selectCase: (caseId: string) => Promise<void>;
+  selectChat: (chatId: string) => Promise<void>;
+  createNewChat: () => Promise<void>;
+  renameChat: (chatId: string, title: string) => Promise<void>;
+  stopAssistantRequest: () => void;
+  retryLastQuestion: () => void;
   createDemoCase: () => void;
   sendMessage: (event: FormEvent) => void;
   sendDemoCaseMessage: (event: FormEvent) => void;
-  handoffToNo: () => void;
+  handoffToNo: (recipient: StaffRecipient, remarks: string) => void;
   verifyByNo: () => void;
-  forwardToHod: () => void;
+  forwardToHod: (recipient: StaffRecipient, remarks: string) => void;
   submitDemo: (event: FormEvent) => void;
   setDemoQuestion: (value: string) => void;
   setCaseMessage: (value: string) => void;
@@ -949,16 +1051,58 @@ function ContextDrawer({ timeline, demoAnswer }: { timeline: CaseTimeline | null
   );
 }
 
-function WorkflowActions({ me, timeline, handoffToNo, verifyByNo, forwardToHod }: { me: Me; timeline: CaseTimeline; handoffToNo: () => void; verifyByNo: () => void; forwardToHod: () => void }) {
+function WorkflowActions({ accessToken, demoActive, me, timeline, handoffToNo, verifyByNo, forwardToHod }: { accessToken: string; demoActive: boolean; me: Me; timeline: CaseTimeline; handoffToNo: (recipient: StaffRecipient, remarks: string) => void; verifyByNo: () => void; forwardToHod: (recipient: StaffRecipient, remarks: string) => void }) {
   const isDo = me.roles.includes("Data Entry Operator");
   const isNo = me.roles.includes("Nodal/Regional Officer");
+  const handoffRole: LocalLoginRole | null = isDo && ["draft", "returned_to_do"].includes(timeline.case.state)
+    ? "Nodal/Regional Officer"
+    : isNo && timeline.case.state === "verified_by_no"
+      ? "HOD"
+      : null;
+  const [recipients, setRecipients] = useState<StaffRecipient[]>([]);
+  const [recipientSubject, setRecipientSubject] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [recipientError, setRecipientError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (handoffRole === null || demoActive) {
+      setRecipients([]);
+      setRecipientSubject("");
+      return () => { cancelled = true; };
+    }
+    void loadCaseRecipients(handoffRole, accessToken).then((items) => {
+      if (cancelled) return;
+      setRecipients(items);
+      setRecipientSubject(items[0]?.subject ?? "");
+      setRecipientError(items.length === 0 ? "No eligible recipient is available in your department and unit." : null);
+    }).catch(() => {
+      if (!cancelled) {
+        setRecipients([]);
+        setRecipientSubject("");
+        setRecipientError("Recipient list could not be loaded.");
+      }
+    });
+    return () => { cancelled = true; };
+  }, [accessToken, demoActive, handoffRole]);
+  const selectedRecipient = recipients.find((item) => item.subject === recipientSubject);
   return (
     <Panel title="Workflow" icon="shield">
       <ol className="timeline-list">{timeline.transitions.map((item) => <li key={item.transition_id}><strong>{item.to_state.replaceAll("_", " ")}</strong><span>{item.actor_role} - {new Date(item.occurred_at).toLocaleString()}</span></li>)}</ol>
       <div className="handoff-actions">
-        {isDo && timeline.case.state === "draft" && <button onClick={handoffToNo} type="button">Submit to NO</button>}
+        {handoffRole && !demoActive && <>
+          <label>Share full case transcript with {handoffRole}
+            <select aria-label={`Recipient ${handoffRole}`} value={recipientSubject} onChange={(event) => setRecipientSubject(event.target.value)}>
+              {recipients.map((recipient) => <option key={recipient.subject} value={recipient.subject}>{recipient.display_name}{recipient.designation ? ` — ${recipient.designation}` : ""}</option>)}
+            </select>
+          </label>
+          <label>Handoff note
+            <textarea aria-label="Handoff note" value={remarks} onChange={(event) => setRemarks(event.target.value)} rows={2} />
+          </label>
+          {recipientError && <p className="workflow-error" role="alert">{recipientError}</p>}
+          {isDo && <button disabled={!selectedRecipient || !remarks.trim()} onClick={() => selectedRecipient && handoffToNo(selectedRecipient, remarks.trim())} type="button">Submit to NO</button>}
+          {isNo && <button disabled={!selectedRecipient || !remarks.trim()} onClick={() => selectedRecipient && forwardToHod(selectedRecipient, remarks.trim())} type="button">Submit to HOD</button>}
+        </>}
         {isNo && timeline.case.state === "submitted_to_no" && <button onClick={verifyByNo} type="button">Verify</button>}
-        {isNo && timeline.case.state === "verified_by_no" && <button onClick={forwardToHod} type="button">Submit to HOD</button>}
       </div>
     </Panel>
   );
@@ -1017,6 +1161,8 @@ function NotFoundPage() {
 
 function AppRuntime() {
   const [cases, setCases] = useState<CaseRecord[]>([]);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  const [selectedChat, setSelectedChat] = useState<ChatResponse | null>(null);
   const [timeline, setTimeline] = useState<CaseTimeline | null>(null);
   const [me, setMe] = useState<Me | null>(null);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -1029,6 +1175,11 @@ function AppRuntime() {
   const [demoActive, setDemoActive] = useState(false);
   const [demoQuestion, setDemoQuestion] = useState("");
   const [demoAnswer, setDemoAnswer] = useState<DemoAnswer | null>(null);
+  const [streamingStage, setStreamingStage] = useState<string | null>(null);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [completionMessage, setCompletionMessage] = useState<string | null>(null);
+  const [lastQuestion, setLastQuestion] = useState<string | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
   const [demoCaseMessage, setDemoCaseMessage] = useState("");
   const [caseMessage, setCaseMessage] = useState("");
   const accessToken = window.pmsAuth?.accessToken ?? "";
@@ -1036,6 +1187,14 @@ function AppRuntime() {
 
   async function refreshCases(token = accessToken) {
     setCases(await loadCaseQueue(token));
+  }
+
+  async function refreshChats(token = accessToken) {
+    try {
+      setChats(await loadChats(token));
+    } catch {
+      setChats([]);
+    }
   }
 
   useEffect(() => {
@@ -1063,6 +1222,7 @@ function AppRuntime() {
           setDemoActive(true);
           setError(null);
           setCases(await loadCaseQueue(""));
+          await refreshChats("");
           try { setAudit(await loadAudit("")); } catch { setAudit([]); }
           setAuthChecked(true);
           return;
@@ -1076,6 +1236,7 @@ function AppRuntime() {
         setMe(identity);
         setError(null);
         if (!identity.roles.includes("Tenant")) setCases(await loadCaseQueue(accessToken));
+        await refreshChats(accessToken);
         try { setAudit(await loadAudit(accessToken)); } catch { setAudit([]); }
       } catch (reason) {
         if (reason instanceof ApiError && reason.status === 401) {
@@ -1106,6 +1267,7 @@ function AppRuntime() {
       const demoIdentity = await startDemoSession(identity);
       setMe(demoIdentity);
       setCases(await loadCaseQueue(""));
+      await refreshChats("");
       try { setAudit(await loadAudit("")); } catch { setAudit([]); }
       setDemoActive(true);
       setAuthenticated(true);
@@ -1125,6 +1287,7 @@ function AppRuntime() {
       setAuthenticated(true);
       setDemoActive(false);
       if (!identity.roles.includes("Tenant")) await refreshCases("");
+      await refreshChats("");
       try { setAudit(await loadAudit("")); } catch { setAudit([]); }
       navigate("/dashboard", { replace: true });
     } catch (reason) {
@@ -1144,6 +1307,8 @@ function AppRuntime() {
     setDemoAnswer(null);
     setTimeline(null);
     setCases([]);
+    setChats([]);
+    setSelectedChat(null);
     setAudit([]);
     navigate("/", { replace: true });
   }
@@ -1161,6 +1326,8 @@ function AppRuntime() {
     setDemoAnswer(null);
     setTimeline(null);
     setCases([]);
+    setChats([]);
+    setSelectedChat(null);
     setAudit([]);
     navigate("/", { replace: true });
   }
@@ -1183,22 +1350,88 @@ function AppRuntime() {
     }
   }
 
-  async function submitDemo(event: FormEvent) {
-    event.preventDefault();
-    if (!demoQuestion.trim()) return;
+  async function selectChat(chatId: string) {
+    try {
+      setError(null);
+      const chat = await loadChat(chatId, demoActive ? "" : accessToken);
+      setSelectedChat(chat);
+      navigate(`/assistant/chats/${chatId}`);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  async function renameChat(chatId: string, title: string) {
+    const renamed = await updateChat(chatId, { title }, demoActive ? "" : accessToken);
+    setSelectedChat(renamed);
+    await refreshChats(demoActive ? "" : accessToken);
+  }
+
+  async function createNewChat() {
     try {
       setBusy(true);
-      const result = await runDemoQuery(demoQuestion.trim());
-      setDemoAnswer(result);
-      if (timeline && result.route !== "REQUEST_REFUSED" && !result.review_required) {
-        await postCaseMessage(timeline.case.case_id, `Assistant result: ${result.answer}`, demoActive ? "" : accessToken);
-        setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
-      }
+      setError(null);
+      const chat = await createChat({ title: "New Chat", chat_type: "PERSONAL" }, demoActive ? "" : accessToken);
+      setSelectedChat(chat);
+      await refreshChats(demoActive ? "" : accessToken);
+      navigate(`/assistant/chats/${chat.chat_id}`);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function submitQuestion(question: string) {
+    if (!question.trim() || !me || busy || activeRequest.current !== null) return;
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    try {
+      setBusy(true);
+      setRequestError(null);
+      setCompletionMessage(null);
+      setStreamingStage("reading_question");
+      const document = await runPolicyQueryStream(
+        question.trim(),
+        demoActive ? "" : accessToken,
+        (stage) => setStreamingStage(stage),
+        controller.signal,
+        selectedChat?.chat_id
+      );
+      const result = documentAnswerForWorkspace(document, me);
+      setDemoAnswer(result);
+      setCompletionMessage("Answer validated and ready.");
+      if (timeline && result.route !== "REQUEST_REFUSED" && !result.review_required) {
+        await postCaseMessage(timeline.case.case_id, `Assistant result: ${result.answer}`, demoActive ? "" : accessToken);
+        setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
+      }
+    } catch (reason) {
+      if (!(reason instanceof DOMException && reason.name === "AbortError")) setRequestError(errorMessage(reason));
+    } finally {
+      activeRequest.current = null;
+      setStreamingStage(null);
+      setBusy(false);
+    }
+  }
+
+  async function submitDemo(event: FormEvent) {
+    event.preventDefault();
+    const question = demoQuestion.trim();
+    if (!question) return;
+    setLastQuestion(question);
+    await submitQuestion(question);
+  }
+
+  function retryLastQuestion() {
+    if (lastQuestion) void submitQuestion(lastQuestion);
+  }
+
+  function stopAssistantRequest() {
+    activeRequest.current?.abort();
+    activeRequest.current = null;
+    setStreamingStage(null);
+    setBusy(false);
+    setRequestError("The request was cancelled. You can retry it when ready.");
   }
 
   async function sendCaseMessage(event: FormEvent) {
@@ -1217,9 +1450,9 @@ function AppRuntime() {
     setTimeline(await loadTimeline(timeline.case.case_id, ""));
   }
 
-  async function handoffToNo() {
+  async function handoffToNo(recipient: StaffRecipient, remarks: string) {
     if (!timeline) return;
-    await submitToNo(timeline.case.case_id, demoActive ? "" : accessToken);
+    await submitToNo(timeline.case.case_id, demoActive ? "" : accessToken, recipient.subject, remarks);
     setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
     await refreshCases(demoActive ? "" : accessToken);
   }
@@ -1231,9 +1464,9 @@ function AppRuntime() {
     await refreshCases(demoActive ? "" : accessToken);
   }
 
-  async function forwardToHod() {
+  async function forwardToHod(recipient: StaffRecipient, remarks: string) {
     if (!timeline) return;
-    await submitToHod(timeline.case.case_id, demoActive ? "" : accessToken);
+    await submitToHod(timeline.case.case_id, demoActive ? "" : accessToken, recipient.subject, remarks);
     setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
     await refreshCases(demoActive ? "" : accessToken);
   }
@@ -1243,9 +1476,11 @@ function AppRuntime() {
   const currentMe = me;
 
   const assistantProps: AssistantProps = {
-    accessToken,
+    accessToken: demoActive ? "" : accessToken,
     me: currentMe,
     cases,
+    chats,
+    selectedChat,
     timeline,
     demoActive,
     demoAnswer,
@@ -1253,7 +1488,15 @@ function AppRuntime() {
     caseMessage,
     demoCaseMessage,
     demoQuestion,
+    streamingStage,
+    requestError,
+    completionMessage,
     selectCase,
+    selectChat,
+    createNewChat,
+    renameChat,
+    stopAssistantRequest,
+    retryLastQuestion,
     createDemoCase,
     sendMessage: sendCaseMessage,
     sendDemoCaseMessage,
@@ -1286,6 +1529,8 @@ function AppRuntime() {
     params = matchRoute("/documents/:documentId", path);
     if (params) return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><DocumentDetailPage accessToken={demoActive ? "" : accessToken} documentId={params.documentId} /></ProtectedRoute>;
     if (path === "/assistant") return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><AssistantPage {...assistantProps} /></ProtectedRoute>;
+    params = matchRoute("/assistant/chats/:chatId", path);
+    if (params) return <ProtectedRoute me={currentMe} allowed={["Tenant", ...ALL_STAFF_ROLES]}><AssistantPage {...assistantProps} selectedChatId={params.chatId} /></ProtectedRoute>;
     params = matchRoute("/assistant/cases/:caseId", path);
     if (params) return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><AssistantPage {...assistantProps} selectedCaseId={params.caseId} /></ProtectedRoute>;
     if (path === "/analytics") return <ProtectedRoute me={currentMe} allowed={ALL_STAFF_ROLES}><AnalyticsPage /></ProtectedRoute>;

@@ -39,6 +39,8 @@ agents.md
 # ============================================================
 
 data/
+data/inbox/*
+!data/inbox/README.md
 docs/
 datasets/
 uploads/
@@ -86,6 +88,7 @@ docs/GITHUB_PUBLISHING_CHECKLIST.md
 *.rar
 
 artifacts/
+logs/
 outputs/
 reports/
 models/
@@ -195,4 +198,3 @@ migration_*_only.sql
 ers15dhaOneDriveDesktopfinal_projectAI_Powered_PMS*
 et
 sword=*
-

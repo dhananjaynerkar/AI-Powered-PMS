@@ -123,14 +123,18 @@ def _java_commands(environ: Mapping[str, str]) -> tuple[tuple[str, ...], ...]:
 def _ollama_command(environ: Mapping[str, str]) -> tuple[str, ...]:
     """Resolve Ollama from PATH or its standard per-user Windows location."""
 
-    path_ollama = shutil.which("ollama")
-    if path_ollama:
-        return (path_ollama, "--version")
     local_app_data = environ.get("LOCALAPPDATA")
     if local_app_data:
         candidate = Path(local_app_data) / "Programs" / "Ollama" / "ollama.exe"
-        if _is_file(candidate):
+        try:
+            installed = candidate.is_file()
+        except OSError:
+            return ("ollama", "--version")
+        if installed:
             return (str(candidate), "--version")
+    path_ollama = shutil.which("ollama")
+    if path_ollama:
+        return (path_ollama, "--version")
     return ("ollama", "--version")
 
 

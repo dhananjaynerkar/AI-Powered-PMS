@@ -2,6 +2,21 @@
 
 ## Overview
 
+### Current conversational workspace status
+
+The source tree now includes the Phase 3 persistent chat workspace: the
+assistant can create, list, open, rename and archive database-backed personal
+or shared-case chats, and the React workspace can display restored chat
+messages, citations, attachments and memory records. Phase 4 also guards the
+real streaming policy route against overlapping requests and provides a
+browser Stop action. The migration
+`db/migrations/versions/20260806_0016_persistent_chat_workspace.py` is still
+pending explicit live review; no chat tables are assumed to exist until it is
+applied. See `docs/PHASE_3_NEW_CHAT_HISTORY.md` and
+`docs/PHASE_4_SINGLE_ACTIVE_REQUEST.md` for the validated boundary.
+Phase 5 adds allowlisted, accessible activity indicators and controlled retry
+states; see `docs/PHASE_5_THINKING_PROGRESS.md`.
+
 The AI-Powered Port Land Lease Management System is a local, auditable
 assistant for port authorities, estate officers and tenants. It brings policy
 documents and operational lease data into one controlled workspace so that a
@@ -317,3 +332,37 @@ The system should answer quickly when authorised evidence is strong, explain
 where the answer came from, preserve the complete case history, and stop for a
 human whenever the evidence is not sufficient. That balance—speed without
 invented certainty—is the central design objective.
+
+## Complexity assessment and active pilot scope
+
+The repository contains more capability than is required for the first client
+demonstration. Authentication alternatives, controlled-demo routing, document
+RAG, structured queries, graph provenance, forecasting, rules and workflow
+services are separate boundaries, but they are not all required to prove the
+primary value proposition at the same time.
+
+For the pilot, validate one vertical slice first:
+
+```text
+Approved login → role-authorised assistant → /api/v1/policy/query
+→ OpenDataLoader and quality gate → protected chunks
+→ lexical + dense retrieval → rank fusion → reranking
+→ Qwen grounded generation → citation validation
+→ answer, source PDF/page, review state and audit event
+```
+
+Graph, forecasting, advanced handoff and controlled-demo features may remain
+in the repository, but should stay disabled or outside the pilot script until
+the core slice is proven. They must not silently replace the real document
+route.
+
+The pilot is not proven by a UI readiness banner alone. Before presenting an
+indexed-PDF answer, verify live counts in `pms_doc.document_record`,
+`pms_vector.document_chunk`, `pms_vector.chunk_embedding` and
+`pms_vector.chunk_acl`, and confirm that the authenticated account is
+authorised for those chunks. A checkpoint file or an earlier “indexed” result
+is not proof that rows currently exist in the configured database.
+
+This is an operational simplification, not a security shortcut. ACL/RLS,
+citation validation, audit logging, quality gates and read-only database
+boundaries remain mandatory.

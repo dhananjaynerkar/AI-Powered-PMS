@@ -127,7 +127,7 @@ DEMO_CONTEXTS: dict[DemoIdentity, AuthorizationContext] = {
         tenant_id=None,
         department_id="estate",
         unit_id="head-office",
-        classification=Classification.INTERNAL,
+        classification=Classification.RESTRICTED,
     ),
 }
 

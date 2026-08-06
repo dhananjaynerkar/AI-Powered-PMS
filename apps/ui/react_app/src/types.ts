@@ -79,6 +79,83 @@ export interface CaseTimeline {
   capsules: ContextCapsule[];
 }
 
+export type ChatType = "PERSONAL" | "SHARED_CASE";
+export type ChatStatus = "ACTIVE" | "ARCHIVED" | "CLOSED";
+
+export interface ChatSummary {
+  chat_id: string;
+  owner_subject: string;
+  title: string;
+  chat_type: ChatType;
+  status: ChatStatus;
+  case_id: string | null;
+  created_at: string;
+  updated_at: string;
+  last_message_at: string | null;
+}
+
+export interface ChatCitation {
+  citation_id: string;
+  message_id: string;
+  source_id: string;
+  canonical_document_id: string;
+  document_version_id: string;
+  page_number: number;
+  block_id: string | null;
+  section_number: string | null;
+  clause_number: string | null;
+  bounding_box: unknown;
+  created_at: string;
+}
+
+export interface ChatMessage {
+  message_id: string;
+  chat_id: string;
+  sequence_number: number;
+  sender_subject: string | null;
+  message_role: "user" | "assistant" | "system";
+  content: string;
+  message_status: "pending" | "streaming" | "completed" | "failed" | "cancelled";
+  model_name: string | null;
+  route: string | null;
+  review_required: boolean;
+  created_at: string;
+  completed_at: string | null;
+  failure_reason: string | null;
+  citations: ChatCitation[];
+}
+
+export interface ChatAttachment {
+  attachment_id: string;
+  chat_id: string;
+  uploaded_by_subject: string;
+  canonical_document_id: string | null;
+  original_filename: string;
+  checksum_sha256: string;
+  mime_type: string;
+  size_bytes: number;
+  ingestion_status: string;
+  classification: string;
+  created_at: string;
+  ready_at: string | null;
+  failure_reason: string | null;
+  review_reason: string | null;
+}
+
+export interface ChatResponse extends ChatSummary {
+  messages: ChatMessage[];
+  attachments: ChatAttachment[];
+  memory: { summary: string; last_summarized_sequence: number; summary_version: number; updated_at: string } | null;
+}
+
+export interface StaffRecipient {
+  subject: string;
+  display_name: string;
+  username: string;
+  designation: string | null;
+  role: LocalLoginRole;
+}
+
 export interface Me {
   subject: string;
   roles: string[];

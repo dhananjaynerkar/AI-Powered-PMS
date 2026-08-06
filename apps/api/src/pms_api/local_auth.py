@@ -12,11 +12,10 @@ import time
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from sqlalchemy import Engine, text
-
 from pms_common.security import AuthorizationContext, Classification, UserRole
 from pms_common.settings import Settings
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from sqlalchemy import Engine, text
 
 LocalLoginRole = Literal[
     "Data Entry Operator",
@@ -191,7 +190,7 @@ class LocalAuthService:
             roles=frozenset({credential.role}),
             tenant_id=credential.tenant_id,
             department_id=credential.department_id,
-            classification=Classification.INTERNAL,
+            classification=_classification_for_role(credential.role),
             unit_id=credential.unit_id,
         )
         token = secrets.token_urlsafe(32)
@@ -272,9 +271,9 @@ class DatabaseLocalAuthService(LocalAuthService):
             subject=f"local.{user['user_name']}",
             roles=frozenset({_role_to_user_role(role)}),
             tenant_id=None,
-            department_id=str(user["department"]) if user["department"] is not None else None,
-            classification=Classification.INTERNAL,
-            unit_id=str(user["unit"]) if user["unit"] is not None else None,
+            department_id=_department_scope_value(user["department"]),
+            classification=_classification_for_role(_role_to_user_role(role)),
+            unit_id=_scope_value(user["unit"]),
         )
         token = secrets.token_urlsafe(32)
         with self._lock:
@@ -289,9 +288,46 @@ def _active_account(value: object) -> bool:
     return str(value or "").strip().upper() in {"A", "ACTIVE", "1", "Y"}
 
 
+def _classification_for_role(role: UserRole) -> Classification:
+    """Give the three internal staff roles one shared document clearance."""
+
+    staff_roles = {
+        UserRole.DATA_ENTRY_OPERATOR,
+        UserRole.NODAL_REGIONAL_OFFICER,
+        UserRole.HOD,
+    }
+    return Classification.RESTRICTED if role in staff_roles else Classification.INTERNAL
+
+
+def _scope_value(value: object) -> str | None:
+    """Normalize database null sentinels before building authorization scope."""
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return None if normalized.lower() in {"", "null", "none"} else normalized
+
+
+def _department_scope_value(value: object) -> str | None:
+    """Return the canonical department form used by document ACL values."""
+
+    normalized = _scope_value(value)
+    return normalized.casefold() if normalized is not None else None
+
+
 def _role_code(role: LocalLoginRole) -> str:
-    return {"Data Entry Operator": "DO", "Nodal/Regional Officer": "NO", "HOD": "HO", "Tenant": "TN"}[role]
+    return {
+        "Data Entry Operator": "DO",
+        "Nodal/Regional Officer": "NO",
+        "HOD": "HO",
+        "Tenant": "TN",
+    }[role]
 
 
 def _role_to_user_role(role: str) -> UserRole:
-    return {"DO": UserRole.DATA_ENTRY_OPERATOR, "NO": UserRole.NODAL_REGIONAL_OFFICER, "HO": UserRole.HOD, "TN": UserRole.TENANT}[role]
+    return {
+        "DO": UserRole.DATA_ENTRY_OPERATOR,
+        "NO": UserRole.NODAL_REGIONAL_OFFICER,
+        "HO": UserRole.HOD,
+        "TN": UserRole.TENANT,
+    }[role]

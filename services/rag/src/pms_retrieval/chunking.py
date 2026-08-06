@@ -10,6 +10,7 @@ from typing import Protocol
 
 from pms_common.security import AuthorizationContext, Classification
 from pms_common.settings import Settings
+from pms_common.text import remove_nul_characters
 from pms_ingestion.parsing import (
     BlockKind,
     CanonicalBlock,
@@ -129,7 +130,7 @@ class StructureAwareChunker:
         units: list[_Unit] = []
         for page in canonical.pages:
             for block in page.blocks:
-                text = block.text.strip()
+                text = (remove_nul_characters(block.text) or "").strip()
                 if not text:
                     continue
                 if block.kind is BlockKind.HEADING:
@@ -258,7 +259,7 @@ class StructureAwareChunker:
         parent_chunk_id: str | None,
         units: Sequence[_Unit],
     ) -> DocumentChunk:
-        text = self._group_text(units)
+        text = remove_nul_characters(self._group_text(units)) or ""
         token_count = self._tokenizer.count(text)
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         chunk_id = hashlib.sha256(

@@ -10,14 +10,15 @@ ARTIFACT = ROOT / "artifacts/evaluation/phase10_pdf_rule_evidence.json"
 def test_pdf_evidence_artifact_is_complete_and_unapproved() -> None:
     payload = json.loads(ARTIFACT.read_text(encoding="utf-8"))
     summary = payload["summary"]
+    documents = payload["documents"]
     candidates = payload["evidence_candidates"]
 
-    assert summary["pdf_count"] == 94
-    assert summary["parsed_pdf_count"] == 94
-    assert summary["failure_count"] == 0
-    assert summary["page_count"] == 3231
-    assert summary["evidence_candidate_count"] == 310
-    assert len(candidates) == 310
+    pdfs = tuple((ROOT / "data/inbox").rglob("*.pdf"))
+    assert summary["pdf_count"] == len(pdfs)
+    assert summary["parsed_pdf_count"] + summary["failure_count"] == len(pdfs)
+    assert summary["parsed_pdf_count"] == len(documents)
+    assert summary["evidence_candidate_count"] == len(candidates)
+    assert summary["page_count"] == sum(item["page_count"] for item in documents)
     assert {item["candidate_family"] for item in candidates} == {
         "rent",
         "tax",

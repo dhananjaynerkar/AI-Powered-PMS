@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -11,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Generator, Iterator
+from collections.abc import AsyncIterator, Callable, Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -21,6 +22,15 @@ from typing import Annotated, Literal, Protocol, cast
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pms_case_workflow.chat_models import (
+    ChatAccessMode,
+    ChatParticipant,
+    ChatRecord,
+    ChatStatus,
+    ChatType,
+)
+from pms_case_workflow.chat_repository import ChatStore, PostgresChatStore
+from pms_case_workflow.chat_titles import title_from_first_question
 from pms_case_workflow.models import CreateCase
 from pms_case_workflow.repository import PostgresCaseStore
 from pms_case_workflow.service import (
@@ -77,7 +87,7 @@ from pms_structured.router import DeterministicRouter
 from pms_structured.service import StructuredQueryService
 from pms_structured.templates import ApprovedTemplateRegistry, SqlSafetyError
 from sqlalchemy import Engine
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import RedirectResponse, Response, StreamingResponse
 
 from pms_api.audit import AuditService, AuditServiceProvider, PostgresAuditServiceProvider
 from pms_api.demo import (
@@ -110,7 +120,14 @@ from pms_api.local_auth import (
 from pms_api.schemas import (
     AuditEventResponse,
     CaseResponse,
+    ChatAttachmentResponse,
+    ChatCitationResponse,
+    ChatMemoryResponse,
+    ChatMessageResponse,
+    ChatResponse,
+    ChatSummaryResponse,
     CreateCaseRequest,
+    CreateChatRequest,
     DocumentResponse,
     DocumentUploadResponse,
     HandoffRequest,
@@ -122,12 +139,18 @@ from pms_api.schemas import (
     RemarksRequest,
     RetrievalReadinessResponse,
     RuntimeHealthResponse,
+    StaffRecipientResponse,
     TimelineResponse,
+    UpdateChatRequest,
 )
 from pms_api.semantic_demo import (
     PostgresSemanticDemoProvider,
     SemanticDemoError,
     SemanticDemoProvider,
+)
+from pms_api.staff_directory import (
+    PostgresStaffDirectory,
+    StaffDirectoryError,
 )
 
 
@@ -138,6 +161,15 @@ class ServiceProvider(Protocol):
         self,
         context: AuthorizationContext,
     ) -> AbstractContextManager[CaseWorkflowService]: ...
+
+
+class ChatServiceProvider(Protocol):
+    """Create a transaction-scoped persistent chat store."""
+
+    def __call__(
+        self,
+        context: AuthorizationContext,
+    ) -> AbstractContextManager[ChatStore]: ...
 
 
 class DocumentServiceProvider(Protocol):
@@ -176,6 +208,25 @@ class RagServiceProvider(Protocol):
     ) -> AbstractContextManager[HybridRagService]: ...
 
 
+class StaffDirectoryProvider(Protocol):
+    """Provide a read-only, scope-filtered case-recipient directory."""
+
+    def recipients(
+        self,
+        context: AuthorizationContext,
+        *,
+        role: UserRole,
+    ) -> tuple[object, ...]: ...
+
+    def require_recipient(
+        self,
+        context: AuthorizationContext,
+        *,
+        role: UserRole,
+        subject: str,
+    ) -> object: ...
+
+
 class PostgresServiceProvider:
     """Create a transaction-scoped service backed by PostgreSQL."""
 
@@ -197,6 +248,18 @@ class PostgresServiceProvider:
                     retrieved_message_top_k=self._settings.case_retrieved_message_top_k,
                 ),
             )
+
+
+class PostgresChatServiceProvider:
+    """Create one RLS-scoped chat store per request transaction."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    @contextmanager
+    def __call__(self, context: AuthorizationContext) -> Iterator[ChatStore]:
+        with self._engine.begin() as connection:
+            yield PostgresChatStore(connection, context)
 
 
 class PostgresDocumentServiceProvider:
@@ -337,6 +400,12 @@ class PostgresRagServiceProvider:
 
 
 bearer = HTTPBearer(auto_error=False)
+# A request lock prevents two overlapping generations for one authenticated
+# workspace.  The lock is process-local; PostgreSQL chat/message persistence
+# remains authoritative for durable state and is the next boundary for a
+# multi-process deployment.
+_active_query_locks: dict[str, Lock] = {}
+_active_query_locks_guard = Lock()
 BearerCredentials = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]
 LoginPortal = Literal["staff", "tenant"]
 STAFF_PORTAL_ROLES = frozenset(
@@ -442,6 +511,52 @@ def get_case_service(
 CaseService = Annotated[CaseWorkflowService, Depends(get_case_service)]
 
 
+def get_chat_store(
+    request: Request,
+    context: TrustedContext,
+) -> Generator[ChatStore, None, None]:
+    provider: ChatServiceProvider | None = getattr(
+        request.app.state,
+        "chat_service_provider",
+        None,
+    )
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="chat persistence is not configured",
+        )
+    with provider(context) as store:
+        yield store
+
+
+ChatStoreDependency = Annotated[ChatStore, Depends(get_chat_store)]
+
+
+def get_optional_chat_store(
+    request: Request,
+    context: TrustedContext,
+) -> Generator[ChatStore | None, None, None]:
+    """Expose the transaction-scoped chat store when configured.
+
+    The policy route remains usable before the reviewed chat migration is
+    applied; in that state it falls back to the stricter process guard.
+    """
+
+    provider: ChatServiceProvider | None = getattr(
+        request.app.state,
+        "chat_service_provider",
+        None,
+    )
+    if provider is None:
+        yield None
+        return
+    with provider(context) as store:
+        yield store
+
+
+OptionalChatStoreDependency = Annotated[ChatStore | None, Depends(get_optional_chat_store)]
+
+
 def get_document_service(
     request: Request,
     context: TrustedContext,
@@ -530,6 +645,22 @@ def get_rag_service(
 
 
 RagServiceDependency = Annotated[HybridRagService, Depends(get_rag_service)]
+
+
+def get_staff_directory(request: Request) -> StaffDirectoryProvider:
+    directory = cast(
+        StaffDirectoryProvider | None,
+        getattr(request.app.state, "staff_directory", None),
+    )
+    if directory is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="staff directory is not configured",
+        )
+    return directory
+
+
+StaffDirectoryDependency = Annotated[StaffDirectoryProvider, Depends(get_staff_directory)]
 
 
 def get_audit_service(
@@ -678,8 +809,150 @@ def _is_loopback_request(request: Request) -> bool:
     return request.client is not None and request.client.host in {"127.0.0.1", "::1", "localhost"}
 
 
+def _sse_event(event: str, payload: object) -> str:
+    """Serialize one small server-sent event without exposing internal errors."""
+
+    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+def _stream_grounded_answer(
+    request: PolicyQueryRequest,
+    service: HybridRagService,
+    release_lock: Callable[[], None],
+) -> StreamingResponse:
+    """Stream safe progress while retaining final citation validation as a hard gate."""
+
+    async def events() -> AsyncIterator[str]:
+        try:
+            # These are coarse user-facing milestones only; no hidden model
+            # reasoning, prompts, SQL or evidence text is streamed.
+            for stage in (
+                "reading_question",
+                "searching_authorized_records",
+                "searching_document_evidence",
+                "reranking_evidence",
+                "generating_answer",
+            ):
+                yield _sse_event("status", {"stage": stage})
+            try:
+                result = await asyncio.to_thread(
+                    service.ask,
+                    request.question,
+                    response_language=request.response_language,
+                    include_trace=request.include_trace,
+                    today=request.as_of_date,
+                )
+            except AuthorizationDenied:
+                yield _sse_event("error", {"detail": "access denied"})
+                return
+            except GenerationError:
+                yield _sse_event(
+                    "error",
+                    {"detail": "document generation service is unavailable"},
+                )
+                return
+            yield _sse_event("status", {"stage": "validating_citations"})
+            yield _sse_event("answer", result.model_dump(mode="json"))
+        finally:
+            release_lock()
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _chat_summary_response(chat: ChatRecord) -> ChatSummaryResponse:
+    return ChatSummaryResponse(
+        chat_id=chat.chat_id,
+        title=chat.title,
+        chat_type=chat.chat_type,
+        status=chat.status,
+        owner_subject=chat.owner_subject,
+        case_id=chat.case_id,
+        created_at=chat.created_at,
+        updated_at=chat.updated_at,
+        last_message_at=chat.last_message_at,
+    )
+
+
+def _chat_response(store: ChatStore, chat: ChatRecord) -> ChatResponse:
+    messages: list[ChatMessageResponse] = []
+    for message in store.list_messages(chat.chat_id):
+        messages.append(
+            ChatMessageResponse(
+                message_id=message.message_id,
+                chat_id=message.chat_id,
+                sequence_number=message.sequence_number,
+                sender_subject=message.sender_subject,
+                message_role=message.message_role,
+                content=message.content,
+                message_status=message.message_status,
+                model_name=message.model_name,
+                route=message.route,
+                review_required=message.review_required,
+                created_at=message.created_at,
+                completed_at=message.completed_at,
+                failure_reason=message.failure_reason,
+                citations=tuple(
+                    ChatCitationResponse(
+                        citation_id=citation.citation_id,
+                        message_id=citation.message_id,
+                        source_id=citation.source_id,
+                        canonical_document_id=citation.canonical_document_id,
+                        document_version_id=citation.document_version_id,
+                        page_number=citation.page_number,
+                        block_id=citation.block_id,
+                        section_number=citation.section_number,
+                        clause_number=citation.clause_number,
+                        bounding_box=citation.bounding_box,
+                        created_at=citation.created_at,
+                    )
+                    for citation in store.list_citations(message.message_id)
+                ),
+            )
+        )
+    memory = store.get_memory(chat.chat_id)
+    return ChatResponse(
+        **_chat_summary_response(chat).model_dump(),
+        messages=tuple(messages),
+        attachments=tuple(
+            ChatAttachmentResponse(
+                attachment_id=attachment.attachment_id,
+                chat_id=attachment.chat_id,
+                uploaded_by_subject=attachment.uploaded_by_subject,
+                canonical_document_id=attachment.canonical_document_id,
+                original_filename=attachment.original_filename,
+                checksum_sha256=attachment.checksum_sha256,
+                mime_type=attachment.mime_type,
+                size_bytes=attachment.size_bytes,
+                ingestion_status=attachment.ingestion_status.value,
+                classification=attachment.classification,
+                created_at=attachment.created_at,
+                ready_at=attachment.ready_at,
+                failure_reason=attachment.failure_reason,
+                review_reason=attachment.review_reason,
+            )
+            for attachment in store.list_attachments(chat.chat_id)
+        ),
+        memory=(
+            ChatMemoryResponse(
+                chat_id=memory.chat_id,
+                summary=memory.summary,
+                last_summarized_sequence=memory.last_summarized_sequence,
+                summary_version=memory.summary_version,
+                updated_at=memory.updated_at,
+            )
+            if memory is not None
+            else None
+        ),
+    )
+
+
 def create_app(
     service_provider: ServiceProvider | None = None,
+    chat_service_provider: ChatServiceProvider | None = None,
     document_service_provider: DocumentServiceProvider | None = None,
     structured_service_provider: StructuredServiceProvider | None = None,
     rule_service_provider: RuleServiceProvider | None = None,
@@ -688,6 +961,7 @@ def create_app(
     demo_structured_provider: DemoStructuredProvider | None = None,
     demo_semantic_provider: SemanticDemoProvider | None = None,
     local_auth_service: LocalAuthService | None = None,
+    staff_directory: StaffDirectoryProvider | None = None,
     *,
     upload_max_bytes: int | None = None,
 ) -> FastAPI:
@@ -712,6 +986,7 @@ def create_app(
         f"{os.getpid()}|{runtime_started_at.isoformat()}|{runtime_fingerprint}".encode()
     ).hexdigest()[:12]
     app.state.case_service_provider = service_provider
+    app.state.chat_service_provider = chat_service_provider
     app.state.document_service_provider = document_service_provider
     app.state.structured_service_provider = structured_service_provider
     app.state.rule_service_provider = rule_service_provider
@@ -720,6 +995,7 @@ def create_app(
     app.state.demo_structured_provider = demo_structured_provider
     app.state.demo_semantic_provider = demo_semantic_provider
     app.state.local_auth_service = local_auth_service
+    app.state.staff_directory = staff_directory
     app.state.upload_max_bytes = upload_max_bytes or Settings().upload_max_mb * 1024 * 1024
 
     @app.get("/auth/login", include_in_schema=False)
@@ -1221,10 +1497,41 @@ def create_app(
         )
 
     @app.post("/api/v1/policy/query", response_model=GroundedAnswer)
-    def policy_query(
+    async def policy_query(
         request: PolicyQueryRequest,
         service: RagServiceDependency,
-    ) -> GroundedAnswer:
+        raw_request: Request,
+        context: TrustedContext,
+        chat_store: OptionalChatStoreDependency,
+    ) -> GroundedAnswer | StreamingResponse:
+        with _active_query_locks_guard:
+            # The subject-level key is intentionally stronger than a
+            # client-supplied chat identifier; an untrusted ID cannot bypass
+            # the concurrency guard by inventing another chat key.
+            query_lock = _active_query_locks.setdefault(context.subject, Lock())
+        if not query_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="another assistant request is already running for this chat",
+            )
+        if chat_store is not None:
+            lock_key = request.chat_id or context.subject
+            if not chat_store.try_acquire_generation_lock(lock_key):
+                query_lock.release()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="another assistant request is already running for this chat",
+                )
+        released = False
+
+        def release_lock() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                query_lock.release()
+
+        if "text/event-stream" in raw_request.headers.get("accept", ""):
+            return _stream_grounded_answer(request, service, release_lock)
         try:
             return service.ask(
                 request.question,
@@ -1241,6 +1548,23 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="document generation service is unavailable",
+            ) from error
+        finally:
+            release_lock()
+
+    @app.get("/api/v1/case-recipients", response_model=tuple[StaffRecipientResponse, ...])
+    def case_recipients(
+        role: UserRole,
+        context: TrustedContext,
+        directory: StaffDirectoryDependency,
+    ) -> tuple[StaffRecipientResponse, ...]:
+        try:
+            recipients = directory.recipients(context, role=role)
+            return tuple(StaffRecipientResponse.model_validate(item) for item in recipients)
+        except (AuthorizationDenied, StaffDirectoryError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="access denied",
             ) from error
 
     @app.post("/api/v1/query", response_model=StructuredAnswer)
@@ -1390,6 +1714,106 @@ def create_app(
             },
         )
 
+    @app.post(
+        "/api/v1/assistant/chats",
+        response_model=ChatResponse,
+        status_code=201,
+    )
+    def create_chat(
+        request: CreateChatRequest,
+        context: TrustedContext,
+        store: ChatStoreDependency,
+    ) -> ChatResponse:
+        if request.chat_type is ChatType.PERSONAL and request.case_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="personal chats cannot link a case",
+            )
+        if request.chat_type is ChatType.SHARED_CASE and request.case_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="shared-case chats require a case_id",
+            )
+        now = datetime.now(UTC)
+        chat = ChatRecord(
+            chat_id=str(secrets.token_urlsafe(24)),
+            owner_subject=context.subject,
+            title=request.title.strip(),
+            chat_type=request.chat_type,
+            status=ChatStatus.ACTIVE,
+            case_id=request.case_id,
+            created_at=now,
+            updated_at=now,
+        )
+        owner_role = min((role.value for role in context.roles), default="user")
+        owner = ChatParticipant(
+            chat_id=chat.chat_id,
+            participant_subject=context.subject,
+            participant_role=owner_role,
+            access_mode=ChatAccessMode.OWNER,
+            added_by_subject=context.subject,
+            added_at=now,
+        )
+        store.create_chat(chat, owner)
+        return _chat_response(store, chat)
+
+    @app.get(
+        "/api/v1/assistant/chats",
+        response_model=tuple[ChatSummaryResponse, ...],
+    )
+    def list_chats(
+        store: ChatStoreDependency,
+        include_archived: bool = Query(default=False),
+    ) -> tuple[ChatSummaryResponse, ...]:
+        return tuple(
+            _chat_summary_response(chat)
+            for chat in store.list_chats(include_archived=include_archived)
+        )
+
+    @app.get(
+        "/api/v1/assistant/chats/{chat_id}",
+        response_model=ChatResponse,
+    )
+    def get_chat(
+        chat_id: str,
+        store: ChatStoreDependency,
+    ) -> ChatResponse:
+        chat = store.get_chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat not found")
+        return _chat_response(store, chat)
+
+    @app.patch(
+        "/api/v1/assistant/chats/{chat_id}",
+        response_model=ChatResponse,
+    )
+    def update_chat(
+        chat_id: str,
+        request: UpdateChatRequest,
+        store: ChatStoreDependency,
+    ) -> ChatResponse:
+        current = store.get_chat(chat_id)
+        if current is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat not found")
+        title = request.title.strip() if request.title is not None else None
+        if title is None and request.first_question is not None and current.title == "New Chat":
+            title = title_from_first_question(request.first_question)
+        updated = store.update_chat(chat_id, title=title, status=request.status)
+        return _chat_response(store, updated)
+
+    @app.delete(
+        "/api/v1/assistant/chats/{chat_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def archive_chat(
+        chat_id: str,
+        store: ChatStoreDependency,
+    ) -> Response:
+        if store.get_chat(chat_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat not found")
+        store.archive_chat(chat_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.post("/api/v1/cases", response_model=CaseResponse, status_code=201)
     def create_case(
         request: CreateCaseRequest,
@@ -1470,15 +1894,28 @@ def create_app(
         case_id: str,
         request: HandoffRequest,
         service: CaseWorkflowService,
+        context: AuthorizationContext,
+        directory: StaffDirectoryProvider,
+        recipient_role: UserRole,
     ) -> object:
         try:
+            directory.require_recipient(
+                context,
+                role=recipient_role,
+                subject=request.assigned_subject,
+            )
             method = getattr(service, method_name)
             return method(
                 case_id,
                 assigned_subject=request.assigned_subject,
                 remarks=request.remarks,
             )
-        except (CaseWorkflowError, CaseAccessDenied) as error:
+        except (
+            CaseWorkflowError,
+            CaseAccessDenied,
+            StaffDirectoryError,
+            AuthorizationDenied,
+        ) as error:
             raise _case_error(error) from error
 
     @app.post("/api/v1/cases/{case_id}/submit-to-no", response_model=CaseResponse)
@@ -1486,24 +1923,54 @@ def create_app(
         case_id: str,
         request: HandoffRequest,
         service: CaseService,
+        context: TrustedContext,
+        directory: StaffDirectoryDependency,
     ) -> object:
-        return handoff("submit_to_no", case_id, request, service)
+        return handoff(
+            "submit_to_no",
+            case_id,
+            request,
+            service,
+            context,
+            directory,
+            UserRole.NODAL_REGIONAL_OFFICER,
+        )
 
     @app.post("/api/v1/cases/{case_id}/submit-to-hod", response_model=CaseResponse)
     def submit_to_hod(
         case_id: str,
         request: HandoffRequest,
         service: CaseService,
+        context: TrustedContext,
+        directory: StaffDirectoryDependency,
     ) -> object:
-        return handoff("submit_to_hod", case_id, request, service)
+        return handoff(
+            "submit_to_hod",
+            case_id,
+            request,
+            service,
+            context,
+            directory,
+            UserRole.HOD,
+        )
 
     @app.post("/api/v1/cases/{case_id}/escalate", response_model=CaseResponse)
     def escalate(
         case_id: str,
         request: HandoffRequest,
         service: CaseService,
+        context: TrustedContext,
+        directory: StaffDirectoryDependency,
     ) -> object:
-        return handoff("escalate", case_id, request, service)
+        return handoff(
+            "escalate",
+            case_id,
+            request,
+            service,
+            context,
+            directory,
+            UserRole.HOD,
+        )
 
     def remarks_action(
         method_name: str,
@@ -1584,12 +2051,16 @@ def create_runtime_app() -> FastAPI:
         semantic_provider = PostgresSemanticDemoProvider(engine, settings)
     if settings.local_password_auth_enabled:
         local_auth_service = (
-            LocalAuthService.from_database(engine, ttl_minutes=settings.local_auth_token_ttl_minutes)
+            LocalAuthService.from_database(
+                engine,
+                ttl_minutes=settings.local_auth_token_ttl_minutes,
+            )
             if settings.pms_auth_mode == "local_database_demo"
             else LocalAuthService.from_settings(settings)
         )
     return create_app(
         PostgresServiceProvider(engine, settings),
+        PostgresChatServiceProvider(engine),
         document_provider,
         PostgresStructuredServiceProvider(engine, settings),
         PostgresRuleServiceProvider(engine, settings),
@@ -1598,5 +2069,6 @@ def create_runtime_app() -> FastAPI:
         demo_structured_provider=demo_provider,
         demo_semantic_provider=semantic_provider,
         local_auth_service=local_auth_service,
+        staff_directory=PostgresStaffDirectory(engine),
         upload_max_bytes=settings.upload_max_mb * 1024 * 1024,
     )

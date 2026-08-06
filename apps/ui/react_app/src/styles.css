@@ -267,6 +267,10 @@ h1, h2, h3, p { margin-top: 0; }
 .login-heading h1 { color: #0a3761; font-size: 24px; margin-bottom: 4px; }
 .login-heading p, .login-note { color: #5e7080; font-size: 15px; line-height: 1.5; margin: 0; }
 .login-form { display: grid; gap: 18px; }
+.password-control { position: relative; }
+.password-control input { padding-right: 72px; width: 100%; }
+.password-toggle { background: transparent; color: #17486d; font-size: 13px; font-weight: 800; padding: 8px; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); }
+.password-toggle:hover { background: #edf3f8; }
 .text-link { background: transparent; color: #17486d; font-weight: 700; margin-top: 26px; padding: 0; width: 100%; }
 .login-visual {
   align-self: stretch;
@@ -399,6 +403,13 @@ h1, h2, h3, p { margin-top: 0; }
 .source-strip { border-top: 1px solid #e0e6ec; color: #244d80; display: flex; font-size: 13px; font-weight: 800; justify-content: space-between; margin-top: 14px; padding-top: 12px; }
 .chat-form { align-items: end; border-top: 1px solid #e0e6ec; display: grid; gap: 12px; grid-template-columns: 1fr auto; padding-top: 16px; }
 .chat-form button { background: #073763; color: #fff; font-weight: 800; min-height: 48px; padding: 0 24px; }
+.assistant-activity { align-items: center; color: #315f84; display: flex; font-size: 13px; font-weight: 700; gap: 9px; min-height: 28px; }
+.activity-spinner { animation: assistant-spin .9s linear infinite; border: 3px solid #d8e5ef; border-radius: 50%; border-top-color: #0a4a7b; display: inline-block; height: 16px; width: 16px; }
+.composer-activity { grid-column: 1 / -1; justify-content: flex-start; }
+.assistant-complete-status { color: #237542; font-size: 13px; font-weight: 700; margin: 8px 0 0; }
+.assistant-error { align-items: center; background: #fff5d8; border: 1px solid #e7bb4a; border-radius: 6px; color: #694d00; display: flex; font-size: 13px; gap: 12px; justify-content: space-between; margin-top: 10px; padding: 10px 12px; }
+.assistant-error button { background: transparent; border: 1px solid #a57b00; color: #694d00; font-weight: 800; padding: 5px 12px; }
+@keyframes assistant-spin { to { transform: rotate(360deg); } }
 .answer-meta { align-items: center; display: flex; gap: 10px; margin-bottom: 10px; }
 .answer-meta span:last-child { color: #6d7d8b; font-size: 13px; }
 .context-panel p, .context-panel li, .empty-state { color: #617180; line-height: 1.55; }
