@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from threading import Lock
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from pms_retrieval.models import ContextEvidence, ResponseLanguage
 
 _SOURCE_MARKER = re.compile(r"\[(S\d+)\]")
+_ANSWER_FIELD = re.compile(r'"answer"\s*:\s*"')
 _MODEL_LIST_CACHE_SECONDS = 60.0
 
 
@@ -126,6 +128,7 @@ class OllamaGenerator:
         *,
         response_language: ResponseLanguage,
         model: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> GeneratedDraft:
         if not evidence:
             raise GenerationError("generation requires validated evidence")
@@ -137,6 +140,7 @@ class OllamaGenerator:
                 evidence,
                 response_language=response_language,
                 model=model,
+                on_token=on_token,
             )
         schema = _response_schema()
         payload = {
@@ -169,7 +173,11 @@ class OllamaGenerator:
             },
         }
         try:
-            content = self._chat_content(payload)
+            content = (
+                self._chat_content(payload, on_delta=on_token)
+                if on_token is not None
+                else self._chat_content(payload)
+            )
             parsed = _normalize_inline_citations(json.loads(content))
             parsed = _normalize_evidence_quotes(
                 parsed,
@@ -194,6 +202,30 @@ class OllamaGenerator:
             update={"citation_validation_ms": _elapsed_ms(validation_started)}
         )
 
+    def generate_stream(
+        self,
+        query: str,
+        evidence: tuple[ContextEvidence, ...],
+        *,
+        response_language: ResponseLanguage,
+        model: str,
+        on_token: Callable[[str], None],
+    ) -> GeneratedDraft:
+        """Generate while forwarding only streamed assistant content.
+
+        The structured response is still parsed and citation-validated by the
+        same path as non-streaming generation.  ``think`` remains disabled, so
+        hidden reasoning fields are never forwarded to the caller.
+        """
+
+        return self.generate(
+            query,
+            evidence,
+            response_language=response_language,
+            model=model,
+            on_token=on_token,
+        )
+
     def _generate_compact_answer(
         self,
         query: str,
@@ -201,6 +233,7 @@ class OllamaGenerator:
         *,
         response_language: ResponseLanguage,
         model: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> GeneratedDraft:
         source = evidence[0]
         language = {
@@ -232,7 +265,7 @@ class OllamaGenerator:
                 },
             ],
             "format": schema,
-            "stream": False,
+            "stream": self._settings.llm_streaming,
             "think": False,
             "keep_alive": self._settings.llm_keep_alive,
             "options": {
@@ -243,7 +276,7 @@ class OllamaGenerator:
             },
         }
         try:
-            parsed = json.loads(self._chat_content(payload))
+            parsed = json.loads(self._chat_content(payload, on_delta=on_token))
             if not isinstance(parsed, dict) or set(parsed) != {"answer"}:
                 raise ValueError("compact response has an invalid shape")
             answer = _remove_inline_citations(str(parsed["answer"])).strip()
@@ -273,7 +306,12 @@ class OllamaGenerator:
             update={"citation_validation_ms": _elapsed_ms(validation_started)}
         )
 
-    def _chat_content(self, payload: dict[str, Any]) -> str:
+    def _chat_content(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
         endpoint = f"{self._settings.ollama_base_url.rstrip('/')}/api/chat"
         if not self._settings.llm_streaming:
             response = httpx.post(
@@ -288,6 +326,7 @@ class OllamaGenerator:
             return str(body["message"]["content"])
         pieces: list[str] = []
         completed = False
+        streamed_answer_length = 0
         deadline = time.monotonic() + self._settings.llm_request_timeout_seconds
         with httpx.stream(
             "POST",
@@ -304,13 +343,65 @@ class OllamaGenerator:
                 item = json.loads(line)
                 message = item.get("message")
                 if isinstance(message, dict):
-                    pieces.append(str(message.get("content", "")))
+                    delta = str(message.get("content", ""))
+                    pieces.append(delta)
+                    if delta and on_delta is not None:
+                        answer_prefix = _streamed_answer_prefix("".join(pieces))
+                        if len(answer_prefix) > streamed_answer_length:
+                            on_delta(answer_prefix[streamed_answer_length:])
+                            streamed_answer_length = len(answer_prefix)
                 if item.get("done_reason") == "length":
                     raise GenerationError("OUTPUT_TRUNCATED: local model reached its output limit")
                 completed = completed or item.get("done") is True
         if not completed:
             raise GenerationError("local generation stream ended before completion")
         return "".join(pieces)
+
+
+def _streamed_answer_prefix(content: str) -> str:
+    """Extract only the safe, human answer prefix from streamed JSON output."""
+
+    match = _ANSWER_FIELD.search(content)
+    if match is None:
+        return ""
+    raw = content[match.end() :]
+    output: list[str] = []
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if character == '"':
+            break
+        if character != "\\":
+            output.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(raw):
+            break
+        escaped = raw[index + 1]
+        simple = {
+            "\\": "\\",
+            '"': '"',
+            "/": "/",
+            "b": "\b",
+            "f": "\f",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+        }
+        if escaped in simple:
+            output.append(simple[escaped])
+            index += 2
+            continue
+        if escaped == "u" and index + 5 < len(raw):
+            codepoint = raw[index + 2 : index + 6]
+            try:
+                output.append(chr(int(codepoint, 16)))
+            except ValueError:
+                break
+            index += 6
+            continue
+        break
+    return "".join(output)
 
 
 def validate_draft(

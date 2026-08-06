@@ -8,6 +8,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from threading import Event
 from typing import cast
 
 from fastapi import Request
@@ -68,6 +69,18 @@ class MemoryChats(ChatStore):
     def list_messages(self, chat_id: str) -> tuple[ChatMessage, ...]:
         return tuple(message for message in self.messages if message.chat_id == chat_id)
 
+    def get_message_by_idempotency(
+        self, chat_id: str, idempotency_key: str
+    ) -> ChatMessage | None:
+        return next(
+            (
+                message
+                for message in self.messages
+                if message.chat_id == chat_id and message.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
     def list_citations(self, message_id: str) -> tuple[ChatCitation, ...]:
         del message_id
         return ()
@@ -92,9 +105,15 @@ class MemoryChats(ChatStore):
         route: str | None = None,
         review_required: bool = False,
         created_at: datetime,
+        message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> ChatMessage:
+        if idempotency_key is not None:
+            existing = self.get_message_by_idempotency(chat_id, idempotency_key)
+            if existing is not None:
+                return existing
         message = ChatMessage(
-            message_id=f"message-{len(self.messages) + 1}",
+            message_id=message_id or f"message-{len(self.messages) + 1}",
             chat_id=chat_id,
             sequence_number=len(self.messages) + 1,
             sender_subject=sender_subject,
@@ -106,6 +125,7 @@ class MemoryChats(ChatStore):
             route=route,
             review_required=review_required,
             created_at=created_at,
+            idempotency_key=idempotency_key,
         )
         self.messages.append(message)
         return message
@@ -202,9 +222,12 @@ def test_chat_crud_is_persistent_and_soft_deletes() -> None:
 
 
 def test_streaming_policy_requests_are_locked_per_subject() -> None:
+    started = Event()
+
     class Rag:
         def ask(self, question: str, **kwargs: object) -> GroundedAnswer:
             del question, kwargs
+            started.set()
             time.sleep(0.15)
             return GroundedAnswer(answer="grounded", confidence="HIGH", review_required=False)
 
@@ -222,11 +245,80 @@ def test_streaming_policy_requests_are_locked_per_subject() -> None:
             first = asyncio.create_task(
                 client.post("/api/v1/policy/query", headers=headers, json={"question": "one"})
             )
-            await asyncio.sleep(0.03)
+            await asyncio.to_thread(started.wait, 2)
             second = await client.post(
                 "/api/v1/policy/query", headers=headers, json={"question": "two"}
             )
             assert second.status_code == 409
             assert (await first).status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_streaming_persists_one_idempotent_assistant_message() -> None:
+    store = MemoryChats()
+
+    class Rag:
+        def ask(self, question: str, **kwargs: object) -> GroundedAnswer:
+            callback = kwargs.get("on_token")
+            if callable(callback):
+                callback("grounded ")
+                callback("answer")
+            return GroundedAnswer(
+                answer="grounded answer",
+                confidence="HIGH",
+                review_required=False,
+                model="configured-model",
+            )
+
+    @contextmanager
+    def chat_provider(context: AuthorizationContext) -> Iterator[ChatStore]:
+        del context
+        yield store
+
+    @contextmanager
+    def rag_provider(context: AuthorizationContext) -> Iterator[Rag]:
+        del context
+        yield Rag()
+
+    app = create_app(
+        chat_service_provider=lambda context: chat_provider(context),
+        rag_service_provider=cast(RagServiceProvider, rag_provider),
+    )
+    app.dependency_overrides[get_authorization_context] = _context
+
+    async def scenario() -> None:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            headers = {"Authorization": "Bearer test"}
+            created = await client.post("/api/v1/assistant/chats", headers=headers, json={})
+            chat_id = created.json()["chat_id"]
+            stream_headers = {**headers, "Accept": "text/event-stream"}
+            body = {
+                "question": "What is the policy?",
+                "chat_id": chat_id,
+                "idempotency_key": "submission-1",
+            }
+            first = await client.post(
+                "/api/v1/policy/query", headers=stream_headers, json=body
+            )
+            assert first.status_code == 200
+            assert "event: accepted" in first.text
+            assert 'event: token\ndata: {"delta": "grounded "}' in first.text
+            assert "event: final" in first.text
+            assert len(store.messages) == 2
+            assert (
+                sum(
+                    message.message_role is ChatMessageRole.ASSISTANT
+                    for message in store.messages
+                )
+                == 1
+            )
+
+            replay = await client.post(
+                "/api/v1/policy/query", headers=stream_headers, json=body
+            )
+            assert replay.status_code == 200
+            assert "grounded answer" in replay.text
+            assert len(store.messages) == 2
 
     asyncio.run(scenario())

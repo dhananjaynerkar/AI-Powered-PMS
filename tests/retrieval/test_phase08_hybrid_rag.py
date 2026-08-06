@@ -19,6 +19,7 @@ from pms_retrieval.generation import (
     GenerationUnavailable,
     OllamaGenerator,
     _normalize_evidence_quotes,
+    _streamed_answer_prefix,
     validate_draft,
 )
 from pms_retrieval.models import (
@@ -33,7 +34,11 @@ from pms_retrieval.query import (
     reciprocal_rank_fusion,
     understand_query,
 )
-from pms_retrieval.rag import HybridRagService, _prioritize_definition_evidence
+from pms_retrieval.rag import (
+    AuthorizationSafeQueryEmbeddingCache,
+    HybridRagService,
+    _prioritize_definition_evidence,
+)
 
 
 def _settings() -> Settings:
@@ -182,6 +187,15 @@ class _Embedder:
 
     def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         return ((1.0, 0.0),) if texts else ()
+
+
+class _CountingEmbedder(_Embedder):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        self.calls += 1
+        return super().embed(texts)
 
 
 class _Reranker:
@@ -542,6 +556,54 @@ def test_lexical_only_query_skips_embedding_and_reranking() -> None:
     assert [name for name, _value in repository.calls] == ["lexical_as_of", "parent_ids"]
 
 
+def test_query_embedding_cache_is_bounded_and_authorization_scoped() -> None:
+    child = _hit("child-1", "An easement is a right.", parent_id="parent-1")
+    embedder = _CountingEmbedder()
+    cache = AuthorizationSafeQueryEmbeddingCache(
+        _settings().model_copy(update={"query_embedding_cache_max_entries": 1})
+    )
+    service = HybridRagService(
+        _Repository((child,), (_hit("parent-1", child.text),)),
+        _context(),
+        _settings(),
+        embedder=embedder,
+        reranker=_Reranker(),
+        generator=_Generator(),
+        tokenizer=_Tokenizer(),
+        query_embedding_cache=cache,
+    )
+
+    first = service.ask("What is an easement?", include_trace=True)
+    second = service.ask("What is an easement?", include_trace=True)
+
+    other_context_service = HybridRagService(
+        _Repository((child,), (_hit("parent-1", child.text),)),
+        _context(auditor=False),
+        _settings(),
+        embedder=embedder,
+        reranker=_Reranker(),
+        generator=_Generator(),
+        tokenizer=_Tokenizer(),
+        query_embedding_cache=cache,
+    )
+    other_context_service.ask("What is an easement?")
+
+    assert embedder.calls == 2
+    assert first.trace is not None
+    assert second.trace is not None
+    assert first.trace.durations_ms["query_embedding_cache_hit"] == 0.0
+    assert second.trace.durations_ms["query_embedding_cache_hit"] == 1.0
+    expected_timings = {
+        "lexical",
+        "query_embedding",
+        "vector_search",
+        "reranking",
+        "generation",
+        "citation_validation",
+    }
+    assert expected_timings.issubset(first.trace.durations_ms)
+
+
 def test_lexical_only_query_retries_without_a_title_filter_when_it_has_no_match() -> None:
     child = _hit("child-1", "An easement is a right.", parent_id="parent-1")
     repository = _PatternRepository((child,), (_hit("parent-1", child.text),))
@@ -698,6 +760,13 @@ def test_ollama_endpoint_must_be_exactly_loopback_local() -> None:
         )
 
 
+def test_streamed_json_exposes_only_answer_text() -> None:
+    assert _streamed_answer_prefix('{"answer":"A partial [S1]"') == "A partial [S1]"
+    assert _streamed_answer_prefix('{"answer":"हिंदी \\u0936ब्द"') == "हिंदी शब्द"
+    assert _streamed_answer_prefix('{"answer":"safe"}') == "safe"
+    assert _streamed_answer_prefix('{"answer":"safe", "thinking":"hidden"}') == "safe"
+
+
 def test_ollama_model_list_is_cached_for_repeated_generation_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -830,7 +899,7 @@ def test_ollama_compact_json_mode_adds_a_server_validated_citation(
     monkeypatch.setattr(
         generator,
         "_chat_content",
-        lambda payload: (
+        lambda payload, **_: (
             captured.update(payload)
             or '{"answer":"An easement is a right. [S1]"}'
         ),
@@ -843,7 +912,7 @@ def test_ollama_compact_json_mode_adds_a_server_validated_citation(
         model="qwen3.5:4b",
     )
 
-    assert captured["stream"] is False
+    assert captured["stream"] is True
     assert captured["format"] == {
         "type": "object",
         "properties": {"answer": {"type": "string"}},

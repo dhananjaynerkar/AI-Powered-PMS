@@ -26,6 +26,13 @@ class ChatStatus(StrEnum):
     CLOSED = "CLOSED"
 
 
+class ChatHandoffAction(StrEnum):
+    SUBMIT_TO_NO = "SUBMIT_TO_NO"
+    RETURN_TO_DO = "RETURN_TO_DO"
+    FORWARD_TO_HOD = "FORWARD_TO_HOD"
+    SHARE = "SHARE"
+
+
 class ChatAccessMode(StrEnum):
     OWNER = "OWNER"
     WRITE = "WRITE"
@@ -69,6 +76,7 @@ class ChatRecord:
     last_message_at: datetime | None = None
     owner_admin_id: int | None = None
     case_id: str | None = None
+    current_owner_subject: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +89,21 @@ class ChatParticipant:
     added_at: datetime
     participant_admin_id: int | None = None
     removed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatHandoffEvent:
+    event_id: str
+    chat_id: str
+    actor_subject: str
+    actor_role: str
+    recipient_subject: str
+    recipient_role: str
+    action: ChatHandoffAction
+    remarks: str
+    created_at: datetime
+    actor_admin_id: int | None = None
+    recipient_admin_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +122,7 @@ class ChatMessage:
     review_required: bool = False
     completed_at: datetime | None = None
     failure_reason: str | None = None
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +157,7 @@ class ChatAttachment:
     ready_at: datetime | None = None
     failure_reason: str | None = None
     review_reason: str | None = None
+    ingestion_job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

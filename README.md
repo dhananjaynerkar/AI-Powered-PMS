@@ -16,6 +16,14 @@ applied. See `docs/PHASE_3_NEW_CHAT_HISTORY.md` and
 `docs/PHASE_4_SINGLE_ACTIVE_REQUEST.md` for the validated boundary.
 Phase 5 adds allowlisted, accessible activity indicators and controlled retry
 states; see `docs/PHASE_5_THINKING_PROGRESS.md`.
+Phase 6 adds true Ollama answer-token streaming over a POST `fetch()` stream,
+safe status/token/citation/final events, durable idempotency and final-message
+persistence; see `docs/PHASE_6_REAL_TOKEN_STREAMING.md`.
+Phase 9 adds source-level DO–NO–HOD sharing for the same persistent chat:
+server-validated database recipients, explicit personal-chat sharing consent,
+current ownership, participant visibility and immutable handoff events.  Its
+`0018` migration is pending review and has not been applied; see
+`docs/PHASE_9_DO_NO_HOD_SHARING.md`.
 
 The AI-Powered Port Land Lease Management System is a local, auditable
 assistant for port authorities, estate officers and tenants. It brings policy

@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Any
 
 from pms_case_workflow.chat_models import (
+    ChatHandoffAction,
     ChatMessageRole,
     ChatMessageStatus,
     ChatStatus,
@@ -56,6 +57,7 @@ class StaffRecipientResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     subject: str
+    admin_id: int | None = None
     display_name: str
     username: str
     designation: str | None
@@ -88,6 +90,7 @@ class ChatSummaryResponse(BaseModel):
     chat_type: ChatType
     status: ChatStatus
     owner_subject: str
+    current_owner_subject: str
     case_id: str | None
     created_at: datetime
     updated_at: datetime
@@ -122,6 +125,7 @@ class ChatMessageResponse(BaseModel):
     created_at: datetime
     completed_at: datetime | None
     failure_reason: str | None
+    idempotency_key: str | None
     citations: tuple[ChatCitationResponse, ...] = ()
 
 
@@ -140,6 +144,7 @@ class ChatAttachmentResponse(BaseModel):
     ready_at: datetime | None
     failure_reason: str | None
     review_reason: str | None
+    ingestion_job_id: str | None
 
 
 class ChatMemoryResponse(BaseModel):
@@ -150,10 +155,42 @@ class ChatMemoryResponse(BaseModel):
     updated_at: datetime
 
 
+class ChatParticipantResponse(BaseModel):
+    participant_subject: str
+    participant_admin_id: int | None
+    participant_role: str
+    access_mode: str
+    added_by_subject: str
+    added_at: datetime
+
+
+class ChatHandoffEventResponse(BaseModel):
+    event_id: str
+    chat_id: str
+    actor_subject: str
+    actor_role: str
+    recipient_subject: str
+    recipient_role: str
+    action: ChatHandoffAction
+    remarks: str
+    created_at: datetime
+
+
+class ChatHandoffRequest(BaseModel):
+    action: ChatHandoffAction
+    recipient_subject: str = Field(min_length=1, max_length=200)
+    recipient_role: UserRole | None = None
+    remarks: str = Field(min_length=1, max_length=4000)
+    confirm_shared_case: bool = False
+    case_id: str | None = Field(default=None, max_length=200)
+
+
 class ChatResponse(ChatSummaryResponse):
     messages: tuple[ChatMessageResponse, ...] = ()
     attachments: tuple[ChatAttachmentResponse, ...] = ()
     memory: ChatMemoryResponse | None = None
+    participants: tuple[ChatParticipantResponse, ...] = ()
+    handoff_events: tuple[ChatHandoffEventResponse, ...] = ()
 
 
 class CaseResponse(BaseModel):
@@ -326,6 +363,8 @@ class MeResponse(BaseModel):
 class PolicyQueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     chat_id: str | None = Field(default=None, max_length=200)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
+    attachment_ids: tuple[str, ...] = ()
     response_language: ResponseLanguage = ResponseLanguage.AUTO
     as_of_date: date | None = None
     include_trace: bool = False

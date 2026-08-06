@@ -20,6 +20,7 @@ import {
   loadCaseQueue,
   loadChat,
   loadChats,
+  handoffChat,
   loadCaseRecipients,
   loadDemoMe,
   loadDemoStatus,
@@ -38,12 +39,16 @@ import {
   submitToHod,
   submitToNo,
   uploadDocument,
+  uploadChatAttachment,
+  removeChatAttachment,
   verifyCase
 } from "./api";
 import type {
   AuditEvent,
   CaseRecord,
   CaseTimeline,
+  ChatAttachment,
+  ChatCitation,
   ChatResponse,
   ChatSummary,
   DemoAnswer,
@@ -77,11 +82,14 @@ type IconName =
   | "logout"
   | "map"
   | "message"
+  | "paperclip"
   | "refresh"
   | "rupee"
   | "search"
   | "send"
   | "shield"
+  | "sparkles"
+  | "stop"
   | "upload"
   | "users";
 
@@ -206,11 +214,14 @@ const iconPaths: Record<IconName, ReactNode> = {
   logout: <><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="M16 17l5-5-5-5" /><path d="M21 12H9" /></>,
   map: <><path d="M9 18l-6 3V6l6-3 6 3 6-3v15l-6 3-6-3z" /><path d="M9 3v15" /><path d="M15 6v15" /></>,
   message: <><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" /></>,
+  paperclip: <><path d="m21.4 11.6-8.8 8.8a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 1 1-2.8-2.8l8.5-8.5" /></>,
   refresh: <><path d="M21 12a9 9 0 0 1-15.5 6.2" /><path d="M3 12A9 9 0 0 1 18.5 5.8" /><path d="M18 2v4h4" /><path d="M6 22v-4H2" /></>,
   rupee: <><path d="M6 3h12" /><path d="M6 8h12" /><path d="M6 13h5a5 5 0 0 0 0-10" /><path d="M6 13l8 8" /></>,
   search: <><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></>,
   send: <><path d="M22 2L11 13" /><path d="M22 2l-7 20-4-9-9-4z" /></>,
   shield: <><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /><path d="M9 12l2 2 4-4" /></>,
+  sparkles: <><path d="m12 3-1.3 4.2L7 8.5l3.7 1.3L12 14l1.3-4.2L17 8.5l-3.7-1.3z" /><path d="m19 14-.8 2.2L16 17l2.2.8L19 20l.8-2.2L22 17l-2.2-.8z" /><path d="m5 14-.7 1.8L2.5 16.5l1.8.7L5 19l.7-1.8 1.8-.7-1.8-.7z" /></>,
+  stop: <><rect x="6" y="6" width="12" height="12" rx="2" /></>,
   upload: <><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M17 8l-5-5-5 5" /><path d="M12 3v12" /></>,
   users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></>
 };
@@ -451,23 +462,29 @@ function Sidebar({
   me,
   demoActive,
   exitDemo,
-  returnHome
+  returnHome,
+  collapsed,
+  mobileOpen,
+  onClose
 }: {
   me: Me;
   demoActive: boolean;
   exitDemo: () => void;
   returnHome: () => void;
+  collapsed: boolean;
+  mobileOpen: boolean;
+  onClose: () => void;
 }) {
   const { pathname } = useRouter();
   const visibleItems = NAV_ITEMS.filter((item) => hasAnyRole(me, item.roles));
   return (
-    <aside className="app-sidebar">
+    <aside className={`app-sidebar${collapsed ? " is-collapsed" : ""}${mobileOpen ? " is-mobile-open" : ""}`}>
       <AppBrand compact />
       <nav aria-label="Application navigation">
         {visibleItems.map((item) => (
           item.path === "/"
             ? (
-              <button aria-label={item.label} key={item.path} onClick={returnHome} title={item.label} type="button">
+              <button aria-label={item.label} key={item.path} onClick={() => { onClose(); returnHome(); }} title={item.label} type="button">
                 <Icon name={item.icon} size={18} />
                 <span>{item.label}</span>
               </button>
@@ -480,15 +497,16 @@ function Sidebar({
             )
         ))}
       </nav>
-      <button className="sidebar-logout" onClick={demoActive ? exitDemo : returnHome} type="button"><Icon name="logout" size={18} /> Logout</button>
+      <button className="sidebar-logout" onClick={() => { onClose(); demoActive ? exitDemo() : returnHome(); }} type="button"><Icon name="logout" size={18} /> Logout</button>
     </aside>
   );
 }
 
-function TopBar({ me, demoActive }: { me: Me; demoActive: boolean }) {
+function TopBar({ me, demoActive, onToggleSidebar }: { me: Me; demoActive: boolean; onToggleSidebar: () => void }) {
   const initials = me.subject.split(".").map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "U";
   return (
     <header className="app-topbar">
+      <button className="sidebar-toggle" aria-label="Toggle navigation" onClick={onToggleSidebar} type="button"><Icon name="grid" size={18} /></button>
       <AppBrand compact />
       <div className="topbar-actions">
         {demoActive && <StatusBadge tone="pending">Controlled local demo</StatusBadge>}
@@ -514,11 +532,41 @@ function AppShell({
   returnHome: () => void;
   children: ReactNode;
 }) {
+  const { pathname } = useRouter();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => document.cookie.split("; ").some((entry) => entry === "pms_sidebar_collapsed=1"));
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+
+  function toggleSidebar() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      document.cookie = `pms_sidebar_collapsed=${next ? "1" : "0"}; max-age=31536000; path=/; samesite=lax`;
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        toggleSidebar();
+      }
+      if (event.key === "Escape") setMobileSidebarOpen(false);
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  });
+
+  useEffect(() => setMobileSidebarOpen(false), [pathname]);
+
   return (
-    <main className="dashboard-shell">
-      <Sidebar me={me} demoActive={demoActive} exitDemo={exitDemo} returnHome={returnHome} />
+    <main className={`dashboard-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+      <button className={`sidebar-overlay${mobileSidebarOpen ? " is-visible" : ""}`} aria-label="Close navigation" onClick={() => setMobileSidebarOpen(false)} type="button" />
+      <Sidebar me={me} demoActive={demoActive} exitDemo={exitDemo} returnHome={returnHome} collapsed={sidebarCollapsed} mobileOpen={mobileSidebarOpen} onClose={() => setMobileSidebarOpen(false)} />
       <section className="dashboard-main">
-        <TopBar me={me} demoActive={demoActive} />
+        <TopBar me={me} demoActive={demoActive} onToggleSidebar={() => {
+          if (window.matchMedia("(max-width: 900px)").matches) setMobileSidebarOpen(true);
+          else toggleSidebar();
+        }} />
         {children}
       </section>
     </main>
@@ -754,6 +802,11 @@ function EvidencePanel({ answer }: { answer: GroundedAnswer }) {
   );
 }
 
+function CitationChips({ citations }: { citations: ChatCitation[] }) {
+  if (citations.length === 0) return null;
+  return <div className="citation-chips" aria-label="Citations">{citations.map((citation, index) => <span className="citation-chip" key={citation.citation_id}>[{index + 1}] {citation.source_id} · p.{citation.page_number}</span>)}</div>;
+}
+
 function documentAnswerForWorkspace(answer: GroundedAnswer, me: Me): DemoAnswer {
   return {
     answer: answer.answer,
@@ -871,7 +924,9 @@ function AssistantPage({
   timeline,
   demoActive,
   demoAnswer,
+  localAnswer,
   busy,
+  streamingAnswer,
   streamingStage,
   requestError,
   completionMessage,
@@ -894,14 +949,21 @@ function AssistantPage({
   demoQuestion,
   setCaseMessage,
   setDemoCaseMessage,
-  selectedCaseId
+  selectedCaseId,
+  uploadAttachment,
+  removeAttachment,
+  shareChat
 }: AssistantProps) {
   const { navigate } = useRouter();
   const [search, setSearch] = useState("");
   const [chatSearch, setChatSearch] = useState("");
+  const [sidebarTab, setSidebarTab] = useState<"chats" | "cases">("chats");
   const [runtime, setRuntime] = useState<RuntimeHealth | null>(null);
   const [retrievalReadiness, setRetrievalReadiness] = useState<RetrievalReadiness | null>(null);
   const [runtimeUnavailable, setRuntimeUnavailable] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInput = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
     let cancelled = false;
     async function refreshRuntime() {
@@ -932,55 +994,119 @@ function AssistantPage({
   }, [selectedChat, selectedChatId, selectChat]);
   const visibleCases = cases.filter((item) => item.title.toLowerCase().includes(search.toLowerCase()) || item.case_id.toLowerCase().includes(search.toLowerCase()));
   const visibleChats = chats.filter((item) => item.title.toLowerCase().includes(chatSearch.toLowerCase()));
+  const attachmentPending = selectedChat?.attachments.some((item) => !["READY", "FAILED", "REVIEW_REQUIRED", "CANCELLED"].includes(item.ingestion_status)) ?? false;
+  async function chooseAttachment(file: File | undefined) {
+    if (!file || !selectedChat || busy) return;
+    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+      setUploadError("PDF attachments only.");
+      return;
+    }
+    try {
+      setUploadError(null);
+      setUploadProgress(0);
+      await uploadAttachment(selectedChat.chat_id, file, setUploadProgress);
+    } catch (reason) {
+      setUploadError(errorMessage(reason));
+    } finally {
+      setUploadProgress(null);
+    }
+  }
+  function submitQuestionForm(event: FormEvent) {
+    if (attachmentPending) {
+      event.preventDefault();
+      setUploadError("Wait for the attachment READY badge before asking a question.");
+      return;
+    }
+    submitDemo(event);
+  }
   return (
     <>
-      <PageHeader title="AI Assistant" subtitle="Large chat workspace with case context and evidence drawer." />
+      <PageHeader title="AI Assistant" subtitle="Ask questions across authorized port documents, policies, leases, cases and structured data.">
+        {retrievalReadiness && <div className="assistant-status-chips" aria-label="Assistant status">
+          <StatusBadge tone={retrievalReadiness.ready_for_questions ? "ready" : "pending"}>{retrievalReadiness.ready_for_questions ? "Ready" : "Not ready"}</StatusBadge>
+          <span>{retrievalReadiness.indexed_documents} documents</span>
+          <span>{retrievalReadiness.embedded_child_chunks} chunks</span>
+          <span>{retrievalReadiness.generation_model}</span>
+        </div>}
+      </PageHeader>
       <section className="assistant-layout">
         <aside className="assistant-left">
-          <button className="full-button" onClick={createNewChat} type="button"><Icon name="message" size={18} /> + New Chat</button>
-          <SearchInput label="Search chats" value={chatSearch} onChange={setChatSearch} />
-          <div className="case-list" aria-label="Saved chats">
-            {visibleChats.length === 0 ? <EmptyState title="No saved chats" text="Create a chat to persist your conversation." /> : visibleChats.map((item) => (
-              <button className={item.chat_id === selectedChatId ? "case-card active" : "case-card"} key={item.chat_id} onClick={() => selectChat(item.chat_id)} type="button">
-                <strong>{item.title}</strong><span>{item.chat_type === "SHARED_CASE" ? "Shared" : "Personal"}</span><small>{new Date(item.updated_at).toLocaleString()}</small>
-              </button>
-            ))}
-          </div>
-          {selectedChat && <button className="secondary-button" type="button" onClick={() => {
-            const title = window.prompt("Chat title", selectedChat.title)?.trim();
-            if (title) void renameChat(selectedChat.chat_id, title);
-          }}>Rename selected chat</button>}
-          {!isTenant(me) && <button className="full-button" onClick={createDemoCase} type="button"><Icon name="message" size={18} /> New Case</button>}
-          <SearchInput label="Search cases" value={search} onChange={setSearch} />
-          <div className="case-list">
-            {visibleCases.length === 0 ? <EmptyState title="No cases visible" text="No authorized cases match the current filter." /> : visibleCases.map((item) => (
-              <button className={item.case_id === selectedCaseId ? "case-card active" : "case-card"} key={item.case_id} onClick={() => navigate(`/assistant/cases/${item.case_id}`)} type="button">
-                <strong>{item.title}</strong><span>{item.state.replaceAll("_", " ")}</span><small>{item.case_id}</small>
-              </button>
-            ))}
-          </div>
+          <div className="assistant-sidebar-heading"><h2>Conversations</h2><span>{sidebarTab === "chats" ? visibleChats.length : visibleCases.length}</span></div>
+          {!isTenant(me) && <div className="assistant-tabs" role="tablist" aria-label="Conversation views">
+            <button className={sidebarTab === "chats" ? "active" : ""} onClick={() => setSidebarTab("chats")} role="tab" aria-selected={sidebarTab === "chats"} type="button">Chats</button>
+            <button className={sidebarTab === "cases" ? "active" : ""} onClick={() => setSidebarTab("cases")} role="tab" aria-selected={sidebarTab === "cases"} type="button">Cases</button>
+          </div>}
+          {sidebarTab === "chats" || isTenant(me) ? <section className="assistant-sidebar-section" aria-label="Chat history">
+            <button className="full-button" onClick={createNewChat} type="button"><Icon name="message" size={18} /> New Chat</button>
+            <SearchInput label="Search conversations" value={chatSearch} onChange={setChatSearch} />
+            <div className="case-list assistant-scroll-list" aria-label="Saved chats">
+              {visibleChats.length === 0 ? <div className="compact-empty"><Icon name="message" size={20} /><strong>No conversations yet</strong><span>Start a new chat to save your conversation.</span></div> : visibleChats.map((item) => (
+                <button className={item.chat_id === selectedChatId ? "case-card active" : "case-card"} key={item.chat_id} onClick={() => selectChat(item.chat_id)} type="button">
+                  <strong>{item.title}</strong><span>{item.chat_type === "SHARED_CASE" ? "Shared" : "Personal"}</span><small>{new Date(item.updated_at).toLocaleString()}</small>
+                </button>
+              ))}
+            </div>
+            {selectedChat && <button className="secondary-button sidebar-secondary-action" type="button" onClick={() => {
+              const title = window.prompt("Chat title", selectedChat.title)?.trim();
+              if (title) void renameChat(selectedChat.chat_id, title);
+            }}>Rename selected chat</button>}
+          </section> : <section className="assistant-sidebar-section" aria-label="Case queue">
+            <button className="full-button" onClick={createDemoCase} type="button"><Icon name="message" size={18} /> New Case</button>
+            <SearchInput label="Search cases" value={search} onChange={setSearch} />
+            <div className="case-list assistant-scroll-list" aria-label="Authorized cases">
+              {visibleCases.length === 0 ? <div className="compact-empty"><Icon name="file" size={20} /><strong>No cases visible</strong><span>No authorized cases match the current filter.</span></div> : visibleCases.map((item) => (
+                <button className={item.case_id === selectedCaseId ? "case-card active" : "case-card"} key={item.case_id} onClick={() => navigate(`/assistant/cases/${item.case_id}`)} type="button">
+                  <strong>{item.title}</strong><span>{item.state.replaceAll("_", " ")}</span><small>{item.case_id}</small>
+                </button>
+              ))}
+            </div>
+          </section>}
         </aside>
         <section className="assistant-center">
           <div className="assistant-header"><StatusBadge>{runtimeUnavailable ? "Backend unavailable" : retrievalReadiness?.ready_for_questions ? "Ready" : "Not ready"}</StatusBadge><span>{retrievalReadiness ? `${retrievalReadiness.indexed_documents} indexed documents · ${retrievalReadiness.embedded_child_chunks} embedded chunks · ${retrievalReadiness.generation_model} ${retrievalReadiness.generation_model_state}` : runtime ? `Backend ${runtime.runtime_id} is checking retrieval readiness.` : "Connecting to the configured backend."}</span></div>
           <div className="chat-thread" aria-live="polite">
-            {!timeline && !selectedChat && <EmptyState title="Open or create a case" text="The assistant can answer controlled questions without a case, but handoff evidence is attached only when a case is open." />}
-            {selectedChat?.messages.map((message) => <article className="assistant-bubble" key={message.message_id}><strong>{message.message_role}</strong><p>{message.content}</p><small>{new Date(message.created_at).toLocaleString()}</small></article>)}
-            {timeline?.messages.map((message) => <article className="assistant-bubble" key={message.message_id}><strong>{message.author_role}</strong><p>{message.body}</p><small>{new Date(message.created_at).toLocaleString()}</small></article>)}
-            {busy && <AssistantActivity stage={streamingStage} />}
+            {!timeline && !selectedChat && <div className="assistant-empty-state">
+              <span className="assistant-empty-icon"><Icon name="sparkles" size={24} /></span>
+              <h2>What can I help you find?</h2>
+              <p>Search authorized leases, land records, policies, cases and documents.</p>
+              <div className="suggested-prompts" aria-label="Suggested prompts">
+                {["Compare two lease policies", "Find clauses about rent escalation", "Show land records for a tenant", "Summarize this document", "Ask about a legal case"].map((prompt) => <button key={prompt} onClick={() => setDemoQuestion(prompt)} type="button">{prompt}</button>)}
+              </div>
+            </div>}
+            {selectedChat?.messages.map((message) => <article className={`assistant-message ${message.message_role === "user" ? "user" : "assistant"}`} key={message.message_id}>
+              <div className="message-author"><span className="message-avatar"><Icon name={message.message_role === "user" ? "users" : "sparkles"} size={15} /></span><strong>{message.message_role === "assistant" ? "AI Assistant" : message.sender_subject ?? "You"}</strong><small>{new Date(message.created_at).toLocaleString()}</small></div>
+              <p>{message.content}</p><CitationChips citations={message.citations} />
+            </article>)}
+            {localAnswer && <>
+              <article className="assistant-message user local-check"><div className="message-author"><strong>You</strong></div><p>{localAnswer.question}</p></article>
+              <article className="assistant-message assistant local-check"><div className="message-author"><span className="message-avatar"><Icon name="sparkles" size={15} /></span><strong>AI Assistant</strong><small>Local identity check</small></div><p>{localAnswer.answer}</p></article>
+            </>}
+            {timeline?.messages.map((message) => <article className="assistant-message case" key={message.message_id}><div className="message-author"><strong>{message.author_role}</strong><small>{new Date(message.created_at).toLocaleString()}</small></div><p>{message.body}</p></article>)}
+            {busy && streamingAnswer && <article className="assistant-message assistant streaming"><div className="message-author"><span className="message-avatar"><Icon name="sparkles" size={15} /></span><strong>AI Assistant</strong></div><p>{streamingAnswer}</p></article>}
             {demoAnswer && <article className="assistant-bubble result">{demoAnswer.document ? <EvidencePanel answer={demoAnswer.document} /> : <p>{demoAnswer.answer}</p>}{demoAnswer.structured && <StructuredEvidence answer={demoAnswer} />}</article>}
             {completionMessage && <p className="assistant-complete-status" role="status">{completionMessage}</p>}
-            {requestError && <div className="assistant-error" role="alert"><span>{requestError}</span><button type="button" onClick={retryLastQuestion}>Retry</button></div>}
+            {(requestError || uploadError) && <div className="assistant-error" role="alert"><span>{requestError || uploadError}</span><button type="button" onClick={retryLastQuestion}>Retry</button></div>}
           </div>
-          <form className="chat-form" onSubmit={submitDemo}>
+          {selectedChat && selectedChat.attachments.length > 0 && <div className="attachment-list" aria-label="Chat attachments">
+            {selectedChat.attachments.map((attachment: ChatAttachment) => <div className="attachment-item" key={attachment.attachment_id}>
+              <Icon name="file" size={16} /><span>{attachment.original_filename} ({Math.ceil(attachment.size_bytes / 1024)} KB)</span><StatusBadge tone={attachment.ingestion_status === "READY" ? "ready" : attachment.ingestion_status === "FAILED" || attachment.ingestion_status === "REVIEW_REQUIRED" ? "pending" : "neutral"}>{attachment.ingestion_status.replaceAll("_", " ")}</StatusBadge><button type="button" aria-label={`Remove ${attachment.original_filename}`} onClick={() => void removeAttachment(selectedChat.chat_id, attachment.attachment_id)}>Remove</button>
+            </div>)}
+          </div>}
+          <form className="chat-form assistant-composer" onSubmit={submitQuestionForm} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void chooseAttachment(event.dataTransfer.files?.[0]); }}>
             {busy && <AssistantActivity stage={streamingStage} nearComposer />}
+            <input ref={fileInput} hidden type="file" accept="application/pdf,.pdf" onChange={(event) => { void chooseAttachment(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+            <div className="composer-toolbar"><button aria-label="Attach PDF" title="Attach PDF" disabled={busy || !selectedChat} onClick={() => fileInput.current?.click()} type="button"><Icon name="paperclip" size={18} /></button><span>Documents</span><span className="composer-model">{retrievalReadiness?.generation_model ?? "Model status unavailable"}</span></div>
             <textarea aria-label="Assistant question" disabled={busy} value={demoQuestion} onChange={(event) => setDemoQuestion(event.target.value)} placeholder="Ask about authorized bills, leases, estates, plots, policies or cases." rows={2} />
-            {busy ? <button type="button" onClick={stopAssistantRequest}><Icon name="refresh" size={18} /> Stop</button> : <button type="submit"><Icon name="send" size={18} /> Send</button>}
+            {busy ? <button className="composer-send" aria-label="Stop generating" title="Stop generating" type="button" onClick={stopAssistantRequest}><Icon name="stop" size={18} /></button> : <button className="composer-send" aria-label="Send question" title="Send question" type="submit"><Icon name="send" size={18} /></button>}
           </form>
+          {uploadProgress !== null && <p className="assistant-complete-status" role="status">Uploading PDF: {uploadProgress}%</p>}
+          {attachmentPending && <p className="assistant-complete-status" role="status">Attachment processing is in progress; it can be used after the READY badge appears.</p>}
         </section>
         <aside className="assistant-right">
           <Panel title="Evidence and Context" icon="file">
             <ContextDrawer timeline={timeline} demoAnswer={demoAnswer} />
           </Panel>
+          {selectedChat && <ChatSharingPanel accessToken={accessToken} demoActive={demoActive} me={me} cases={cases} chat={selectedChat} shareChat={shareChat} />}
           {timeline && <WorkflowActions accessToken={accessToken} demoActive={demoActive} me={me} timeline={timeline} handoffToNo={handoffToNo} verifyByNo={verifyByNo} forwardToHod={forwardToHod} />}
           {timeline && (
             <Panel title="Case Observation" icon="message">
@@ -1006,7 +1132,9 @@ interface AssistantProps {
   timeline: CaseTimeline | null;
   demoActive: boolean;
   demoAnswer: DemoAnswer | null;
+  localAnswer: { question: string; answer: string } | null;
   busy: boolean;
+  streamingAnswer: string;
   caseMessage: string;
   demoCaseMessage: string;
   demoQuestion: string;
@@ -1030,6 +1158,9 @@ interface AssistantProps {
   setCaseMessage: (value: string) => void;
   setDemoCaseMessage: (value: string) => void;
   selectedCaseId?: string;
+  uploadAttachment: (chatId: string, file: File, onProgress: (percent: number) => void) => Promise<void>;
+  removeAttachment: (chatId: string, attachmentId: string) => Promise<void>;
+  shareChat: (chatId: string, payload: { action: "SUBMIT_TO_NO" | "RETURN_TO_DO" | "FORWARD_TO_HOD" | "SHARE"; recipient_subject: string; recipient_role?: string; remarks: string; confirm_shared_case?: boolean; case_id?: string | null }) => Promise<void>;
 }
 
 function StructuredEvidence({ answer }: { answer: DemoAnswer }) {
@@ -1041,14 +1172,84 @@ function ContextDrawer({ timeline, demoAnswer }: { timeline: CaseTimeline | null
   const capsule = timeline?.capsules.at(-1);
   return (
     <div className="context-tabs">
-      <h3>Sources</h3>
-      {demoAnswer?.document ? <EvidencePanel answer={demoAnswer.document} /> : <p>Document sources appear after a RAG answer.</p>}
-      <h3>Context Capsule</h3>
-      {capsule ? <><p><strong>Case:</strong> {timeline?.case.case_id}</p><p><strong>State:</strong> {capsule.current_state.replaceAll("_", " ")}</p><p>{capsule.rolling_summary}</p></> : <p>No case capsule is open.</p>}
-      <h3>Query Details</h3>
-      <p>{demoAnswer?.structured ? demoAnswer.structured.database_objects.join(", ") : "No structured query has run in this conversation."}</p>
+      <details open><summary>Sources <span>{demoAnswer?.document?.sources.length ?? 0}</span></summary>
+        {demoAnswer?.document ? <div className="evidence-source-list">{demoAnswer.document.sources.map((source, index) => <div className="evidence-source" key={source.source_id}><strong>[{index + 1}] {source.document_title}</strong><span>Page {source.page_numbers.join(", ") || "not recorded"}</span><small>{source.clause_number ?? source.section_number ?? "Citation metadata not recorded"}</small></div>)}</div> : <p>No sources yet. Sources will appear after retrieval.</p>}
+      </details>
+      <details open={Boolean(capsule)}><summary>Context <span>{capsule ? "1" : "0"}</span></summary>
+        {capsule ? <><p><strong>Case:</strong> {timeline?.case.case_id}</p><p><strong>State:</strong> {capsule.current_state.replaceAll("_", " ")}</p><p>{capsule.rolling_summary}</p></> : <p>No case capsule is open.</p>}
+      </details>
+      <details><summary>Query details</summary><p>{demoAnswer?.structured ? demoAnswer.structured.database_objects.join(", ") : demoAnswer ? `Route: ${demoAnswer.route}` : "No structured query has run in this conversation."}</p></details>
     </div>
   );
+}
+
+function ChatSharingPanel({
+  accessToken,
+  demoActive,
+  me,
+  cases,
+  chat,
+  shareChat
+}: {
+  accessToken: string;
+  demoActive: boolean;
+  me: Me;
+  cases: CaseRecord[];
+  chat: ChatResponse;
+  shareChat: AssistantProps["shareChat"];
+}) {
+  const isStaff = ["Data Entry Operator", "Nodal/Regional Officer", "HOD"].some((role) => me.roles.includes(role));
+  const isCurrentOwner = chat.current_owner_subject === me.subject;
+  const [action, setAction] = useState<"SUBMIT_TO_NO" | "RETURN_TO_DO" | "FORWARD_TO_HOD" | "SHARE">(() =>
+    me.roles.includes("Data Entry Operator") ? "SUBMIT_TO_NO" : me.roles.includes("Nodal/Regional Officer") ? "RETURN_TO_DO" : "SHARE"
+  );
+  const [role, setRole] = useState<LocalLoginRole>(() =>
+    me.roles.includes("Data Entry Operator") ? "Nodal/Regional Officer" : "Data Entry Operator"
+  );
+  const [recipients, setRecipients] = useState<StaffRecipient[]>([]);
+  const [recipientSubject, setRecipientSubject] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [caseId, setCaseId] = useState(chat.case_id ?? "");
+  const [confirmed, setConfirmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isStaff || !isCurrentOwner || demoActive) return;
+    const targetRole: LocalLoginRole = action === "SUBMIT_TO_NO" || action === "SHARE" ? role : action === "RETURN_TO_DO" ? "Data Entry Operator" : "HOD";
+    let cancelled = false;
+    void loadCaseRecipients(targetRole, accessToken).then((items) => {
+      if (!cancelled) {
+        setRecipients(items);
+        setRecipientSubject(items[0]?.subject ?? "");
+        setRole(targetRole);
+      }
+    }).catch(() => { if (!cancelled) setError("Recipient list could not be loaded."); });
+    return () => { cancelled = true; };
+  }, [accessToken, action, demoActive, isCurrentOwner, isStaff, role]);
+  if (!isStaff || demoActive) return null;
+  const targetRole: LocalLoginRole = action === "RETURN_TO_DO" ? "Data Entry Operator" : action === "FORWARD_TO_HOD" ? "HOD" : role;
+  const privateChat = chat.chat_type === "PERSONAL";
+  return <Panel title="Chat sharing" icon="users">
+    <p>Current owner: <strong>{chat.current_owner_subject}</strong></p>
+    {!isCurrentOwner && <p className="workflow-error">Only the current owner can hand off this chat.</p>}
+    {isCurrentOwner && <>
+      <label>Action<select value={action} onChange={(event) => setAction(event.target.value as typeof action)}>
+        {me.roles.includes("Data Entry Operator") && <option value="SUBMIT_TO_NO">Submit to NO</option>}
+        {me.roles.includes("Nodal/Regional Officer") && <><option value="RETURN_TO_DO">Return to DO</option><option value="FORWARD_TO_HOD">Forward to HOD</option></>}
+        <option value="SHARE">Share with an eligible staff user</option>
+      </select></label>
+      {action === "SHARE" && <label>Recipient role<select value={targetRole} onChange={(event) => setRole(event.target.value as LocalLoginRole)}>
+        {me.roles.includes("Data Entry Operator") && <option value="Nodal/Regional Officer">Nodal/Regional Officer</option>}
+        {!me.roles.includes("Data Entry Operator") && <><option value="Data Entry Operator">Data Entry Operator</option><option value="Nodal/Regional Officer">Nodal/Regional Officer</option><option value="HOD">HOD</option></>}
+      </select></label>}
+      <label>Recipient<select value={recipientSubject} onChange={(event) => setRecipientSubject(event.target.value)}>{recipients.map((recipient) => <option key={recipient.subject} value={recipient.subject}>{recipient.display_name}{recipient.designation ? ` — ${recipient.designation}` : ""}</option>)}</select></label>
+      {privateChat && <><label>Link case before sharing<select value={caseId} onChange={(event) => setCaseId(event.target.value)}><option value="">Select an authorized case</option>{cases.map((item) => <option key={item.case_id} value={item.case_id}>{item.title}</option>)}</select></label><label><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I confirm this private chat becomes a shared case.</label></>}
+      <label>Handoff note<textarea value={remarks} onChange={(event) => setRemarks(event.target.value)} rows={2} /></label>
+      {error && <p className="workflow-error" role="alert">{error}</p>}
+      <button disabled={!recipientSubject || !remarks.trim() || (privateChat && (!caseId || !confirmed))} onClick={() => void shareChat(chat.chat_id, { action, recipient_subject: recipientSubject, recipient_role: targetRole, remarks: remarks.trim(), confirm_shared_case: confirmed, case_id: privateChat ? caseId : null }).catch((reason) => setError(errorMessage(reason)))} type="button">Share / hand off</button>
+    </>}
+    {chat.participants.length > 0 && <><h4>Participants</h4><ul className="timeline-list">{chat.participants.map((item) => <li key={item.participant_subject}><strong>{item.participant_subject}</strong><span>{item.participant_role} · {item.access_mode}</span></li>)}</ul></>}
+    {chat.handoff_events.length > 0 && <><h4>Handoff history</h4><ul className="timeline-list">{chat.handoff_events.map((item) => <li key={item.event_id}><strong>{item.action.replaceAll("_", " ")}</strong><span>{item.actor_subject} → {item.recipient_subject}</span></li>)}</ul></>}
+  </Panel>;
 }
 
 function WorkflowActions({ accessToken, demoActive, me, timeline, handoffToNo, verifyByNo, forwardToHod }: { accessToken: string; demoActive: boolean; me: Me; timeline: CaseTimeline; handoffToNo: (recipient: StaffRecipient, remarks: string) => void; verifyByNo: () => void; forwardToHod: (recipient: StaffRecipient, remarks: string) => void }) {
@@ -1175,7 +1376,9 @@ function AppRuntime() {
   const [demoActive, setDemoActive] = useState(false);
   const [demoQuestion, setDemoQuestion] = useState("");
   const [demoAnswer, setDemoAnswer] = useState<DemoAnswer | null>(null);
+  const [localAnswer, setLocalAnswer] = useState<{ question: string; answer: string } | null>(null);
   const [streamingStage, setStreamingStage] = useState<string | null>(null);
+  const [streamingAnswer, setStreamingAnswer] = useState("");
   const [requestError, setRequestError] = useState<string | null>(null);
   const [completionMessage, setCompletionMessage] = useState<string | null>(null);
   const [lastQuestion, setLastQuestion] = useState<string | null>(null);
@@ -1353,6 +1556,7 @@ function AppRuntime() {
   async function selectChat(chatId: string) {
     try {
       setError(null);
+      setLocalAnswer(null);
       const chat = await loadChat(chatId, demoActive ? "" : accessToken);
       setSelectedChat(chat);
       navigate(`/assistant/chats/${chatId}`);
@@ -1361,9 +1565,44 @@ function AppRuntime() {
     }
   }
 
+  async function uploadAttachment(
+    chatId: string,
+    file: File,
+    onProgress: (percent: number) => void,
+  ): Promise<void> {
+    const uploaded = await uploadChatAttachment(chatId, file, demoActive ? "" : accessToken, onProgress);
+    const chat = await loadChat(chatId, demoActive ? "" : accessToken);
+    setSelectedChat(chat);
+    await refreshChats(demoActive ? "" : accessToken);
+    if (uploaded.ingestion_status !== "READY") {
+      setRequestError("PDF uploaded. Processing will continue until the READY badge appears.");
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const refreshed = await loadChat(chatId, demoActive ? "" : accessToken);
+        setSelectedChat(refreshed);
+        const current = refreshed.attachments.find((item) => item.attachment_id === uploaded.attachment_id);
+        if (!current || ["READY", "FAILED", "REVIEW_REQUIRED", "CANCELLED"].includes(current.ingestion_status)) break;
+      }
+    }
+  }
+
+  async function removeAttachment(chatId: string, attachmentId: string): Promise<void> {
+    await removeChatAttachment(chatId, attachmentId, demoActive ? "" : accessToken);
+    setSelectedChat(await loadChat(chatId, demoActive ? "" : accessToken));
+  }
+
   async function renameChat(chatId: string, title: string) {
     const renamed = await updateChat(chatId, { title }, demoActive ? "" : accessToken);
     setSelectedChat(renamed);
+    await refreshChats(demoActive ? "" : accessToken);
+  }
+
+  async function shareChat(
+    chatId: string,
+    payload: { action: "SUBMIT_TO_NO" | "RETURN_TO_DO" | "FORWARD_TO_HOD" | "SHARE"; recipient_subject: string; recipient_role?: string; remarks: string; confirm_shared_case?: boolean; case_id?: string | null },
+  ): Promise<void> {
+    const updated = await handoffChat(chatId, payload, demoActive ? "" : accessToken);
+    setSelectedChat(updated);
     await refreshChats(demoActive ? "" : accessToken);
   }
 
@@ -1371,6 +1610,7 @@ function AppRuntime() {
     try {
       setBusy(true);
       setError(null);
+      setLocalAnswer(null);
       const chat = await createChat({ title: "New Chat", chat_type: "PERSONAL" }, demoActive ? "" : accessToken);
       setSelectedChat(chat);
       await refreshChats(demoActive ? "" : accessToken);
@@ -1384,32 +1624,45 @@ function AppRuntime() {
 
   async function submitQuestion(question: string) {
     if (!question.trim() || !me || busy || activeRequest.current !== null) return;
+    setLocalAnswer(null);
     const controller = new AbortController();
     activeRequest.current = controller;
     try {
       setBusy(true);
       setRequestError(null);
       setCompletionMessage(null);
+      setStreamingAnswer("");
       setStreamingStage("reading_question");
+      const idempotencyKey = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
       const document = await runPolicyQueryStream(
         question.trim(),
         demoActive ? "" : accessToken,
         (stage) => setStreamingStage(stage),
         controller.signal,
-        selectedChat?.chat_id
+        selectedChat?.chat_id,
+        idempotencyKey,
+        (delta) => setStreamingAnswer((current) => current + delta),
+        undefined,
+        selectedChat?.attachments.filter((item) => item.ingestion_status === "READY").map((item) => item.attachment_id) ?? []
       );
       const result = documentAnswerForWorkspace(document, me);
       setDemoAnswer(result);
       setCompletionMessage("Answer validated and ready.");
+      setStreamingAnswer("");
       if (timeline && result.route !== "REQUEST_REFUSED" && !result.review_required) {
         await postCaseMessage(timeline.case.case_id, `Assistant result: ${result.answer}`, demoActive ? "" : accessToken);
         setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
       }
     } catch (reason) {
-      if (!(reason instanceof DOMException && reason.name === "AbortError")) setRequestError(errorMessage(reason));
+      if (reason instanceof DOMException && reason.name === "AbortError") {
+        setRequestError("The request was cancelled. You can retry it when ready.");
+      } else {
+        setRequestError(errorMessage(reason));
+      }
     } finally {
       activeRequest.current = null;
       setStreamingStage(null);
+      setStreamingAnswer("");
       setBusy(false);
     }
   }
@@ -1419,19 +1672,28 @@ function AppRuntime() {
     const question = demoQuestion.trim();
     if (!question) return;
     setLastQuestion(question);
+    if (/^who are you[?!.,\s]*$/i.test(question)) {
+      setDemoAnswer(null);
+      setRequestError(null);
+      setCompletionMessage("Local identity check complete.");
+      setLocalAnswer({ question, answer: "I'm Port AI Assistant" });
+      return;
+    }
     await submitQuestion(question);
   }
 
   function retryLastQuestion() {
-    if (lastQuestion) void submitQuestion(lastQuestion);
+    if (!lastQuestion) return;
+    if (/^who are you[?!.,\s]*$/i.test(lastQuestion)) {
+      setLocalAnswer({ question: lastQuestion, answer: "I'm Port AI Assistant" });
+      return;
+    }
+    void submitQuestion(lastQuestion);
   }
 
   function stopAssistantRequest() {
     activeRequest.current?.abort();
-    activeRequest.current = null;
-    setStreamingStage(null);
-    setBusy(false);
-    setRequestError("The request was cancelled. You can retry it when ready.");
+    setRequestError("Cancelling the request…");
   }
 
   async function sendCaseMessage(event: FormEvent) {
@@ -1484,11 +1746,13 @@ function AppRuntime() {
     timeline,
     demoActive,
     demoAnswer,
+    localAnswer,
     busy,
     caseMessage,
     demoCaseMessage,
     demoQuestion,
     streamingStage,
+    streamingAnswer,
     requestError,
     completionMessage,
     selectCase,
@@ -1506,7 +1770,10 @@ function AppRuntime() {
     submitDemo,
     setDemoQuestion,
     setCaseMessage,
-    setDemoCaseMessage
+    setDemoCaseMessage,
+    uploadAttachment,
+    removeAttachment,
+    shareChat
   };
 
   const currentPage = renderRoute(pathname);

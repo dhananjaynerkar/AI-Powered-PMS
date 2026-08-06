@@ -73,6 +73,7 @@ class ChunkRepository(Protocol):
         *,
         as_of_date: date,
         document_pattern: str | None = None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]: ...
 
     def exact_vector_search(
@@ -84,6 +85,7 @@ class ChunkRepository(Protocol):
         limit: int,
         as_of_date: date,
         document_pattern: str | None = None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]: ...
 
     def parent_chunks(
@@ -175,9 +177,7 @@ class PostgresChunkRepository:
                 "chunking_version": chunking_version,
             },
         ).mappings()
-        existing = {
-            str(row["chunk_id"]): str(row["content_hash"]) for row in existing_rows
-        }
+        existing = {str(row["chunk_id"]): str(row["content_hash"]) for row in existing_rows}
         stale = tuple(chunk_id for chunk_id in existing if chunk_id not in current_ids)
         if stale:
             self._deactivate_chunk_ids(stale)
@@ -376,11 +376,7 @@ class PostgresChunkRepository:
         pending: list[str] = []
         unchanged: list[str] = []
         for row in rows:
-            target = (
-                unchanged
-                if row["embedded_hash"] == row["content_hash"]
-                else pending
-            )
+            target = unchanged if row["embedded_hash"] == row["content_hash"] else pending
             target.append(str(row["chunk_id"]))
         return EmbeddingPlan(
             document_id=document_id,
@@ -476,6 +472,7 @@ class PostgresChunkRepository:
         *,
         as_of_date: date,
         document_pattern: str | None = None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]:
         if not query.strip():
             return ()
@@ -514,6 +511,12 @@ class PostgresChunkRepository:
                     OR record.title ILIKE :document_pattern
                     OR record.original_filename ILIKE :document_pattern
                   )
+                  AND (
+                    :additional_document_ids_empty
+                    OR record.canonical_document_id = ANY(
+                      CAST(:additional_document_ids AS text[])
+                    )
+                  )
                   AND chunk.fts @@ websearch_to_tsquery('simple', :query)
                 ORDER BY score DESC, chunk.chunk_id
                 LIMIT :limit
@@ -524,6 +527,8 @@ class PostgresChunkRepository:
                 "limit": limit,
                 "as_of_date": as_of_date,
                 "document_pattern": document_pattern,
+                "additional_document_ids": list(additional_document_ids),
+                "additional_document_ids_empty": not additional_document_ids,
             },
         ).mappings()
         return tuple(_hit_from_row(dict(row)) for row in rows)
@@ -537,6 +542,7 @@ class PostgresChunkRepository:
         limit: int,
         as_of_date: date,
         document_pattern: str | None = None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]:
         literal = _vector_literal(vector)
         rows = self._connection.execute(
@@ -585,6 +591,12 @@ class PostgresChunkRepository:
                     OR record.title ILIKE :document_pattern
                     OR record.original_filename ILIKE :document_pattern
                   )
+                  AND (
+                    :additional_document_ids_empty
+                    OR record.canonical_document_id = ANY(
+                      CAST(:additional_document_ids AS text[])
+                    )
+                  )
                   AND embedding.active
                   AND embedding.embedding_model = :model
                   AND embedding.embedding_revision = :revision
@@ -602,6 +614,8 @@ class PostgresChunkRepository:
                 "limit": limit,
                 "as_of_date": as_of_date,
                 "document_pattern": document_pattern,
+                "additional_document_ids": list(additional_document_ids),
+                "additional_document_ids_empty": not additional_document_ids,
             },
         ).mappings()
         return tuple(_hit_from_row(dict(row)) for row in rows)
@@ -654,9 +668,10 @@ class PostgresChunkRepository:
     def corpus_status(self) -> CorpusStatus:
         """Return ACL/RLS-scoped aggregate availability for the live corpus."""
 
-        row = self._connection.execute(
-            text(
-                """
+        row = (
+            self._connection.execute(
+                text(
+                    """
                 SELECT
                   count(DISTINCT record.canonical_document_id) AS indexed_documents,
                   count(DISTINCT parent.chunk_id) AS accepted_parent_chunks,
@@ -684,8 +699,11 @@ class PostgresChunkRepository:
                   AND (child.chunk_id IS NULL OR child_acl.chunk_id IS NOT NULL)
                   AND (child.chunk_id IS NULL OR embedding.chunk_id IS NOT NULL)
                 """
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         return CorpusStatus.model_validate(dict(row))
 
     def deactivate_document(self, document_id: str) -> int:
@@ -841,14 +859,10 @@ def _vector_literal(values: Sequence[float]) -> str:
 def _chunk_from_row(row: dict[str, object]) -> DocumentChunk:
     citations_value = row["bounding_boxes"]
     citations = (
-        citations_value
-        if isinstance(citations_value, list)
-        else json.loads(str(citations_value))
+        citations_value if isinstance(citations_value, list) else json.loads(str(citations_value))
     )
     heading_value = row["heading_path"]
-    heading = (
-        heading_value if isinstance(heading_value, list) else json.loads(str(heading_value))
-    )
+    heading = heading_value if isinstance(heading_value, list) else json.loads(str(heading_value))
     return DocumentChunk(
         chunk_id=str(row["chunk_id"]),
         canonical_document_id=str(row["canonical_document_id"]),
@@ -862,23 +876,15 @@ def _chunk_from_row(row: dict[str, object]) -> DocumentChunk:
         token_count=int(str(row["token_count"])),
         content_hash=str(row["content_hash"]),
         heading_path=tuple(str(item) for item in heading),
-        page_numbers=tuple(
-            int(str(item)) for item in _object_sequence(row["page_numbers"])
-        ),
+        page_numbers=tuple(int(str(item)) for item in _object_sequence(row["page_numbers"])),
         citations=tuple(ChunkCitation.model_validate(item) for item in citations),
-        section_number=(
-            str(row["section_number"]) if row["section_number"] is not None else None
-        ),
-        clause_number=(
-            str(row["clause_number"]) if row["clause_number"] is not None else None
-        ),
+        section_number=(str(row["section_number"]) if row["section_number"] is not None else None),
+        clause_number=(str(row["clause_number"]) if row["clause_number"] is not None else None),
         language_code=str(row["language_code"]),
         languages=tuple(str(item) for item in _object_sequence(row["languages"])),
         script_code=str(row["script_code"]),
         translation_group_id=(
-            str(row["translation_group_id"])
-            if row["translation_group_id"] is not None
-            else None
+            str(row["translation_group_id"]) if row["translation_group_id"] is not None else None
         ),
         authoritative_language=(
             str(row["authoritative_language"])
@@ -890,15 +896,11 @@ def _chunk_from_row(row: dict[str, object]) -> DocumentChunk:
         effective_to=row["effective_to"],  # type: ignore[arg-type]
         document_status=str(row["document_status"]),
         port_id=str(row["port_id"]) if row["port_id"] is not None else None,
-        department_id=(
-            str(row["department_id"]) if row["department_id"] is not None else None
-        ),
+        department_id=(str(row["department_id"]) if row["department_id"] is not None else None),
         security_classification=Classification(str(row["security_classification"])),
         review_status=str(row["review_status"]),
         ocr_confidence=(
-            float(str(row["ocr_confidence"]))
-            if row["ocr_confidence"] is not None
-            else None
+            float(str(row["ocr_confidence"])) if row["ocr_confidence"] is not None else None
         ),
         parser_name=str(row["parser_name"]),
         parser_version=str(row["parser_version"]),
@@ -909,14 +911,10 @@ def _chunk_from_row(row: dict[str, object]) -> DocumentChunk:
 def _hit_from_row(row: dict[str, object]) -> RetrievalHit:
     citations_value = row["bounding_boxes"]
     citations = (
-        citations_value
-        if isinstance(citations_value, list)
-        else json.loads(str(citations_value))
+        citations_value if isinstance(citations_value, list) else json.loads(str(citations_value))
     )
     heading_value = row["heading_path"]
-    heading = (
-        heading_value if isinstance(heading_value, list) else json.loads(str(heading_value))
-    )
+    heading = heading_value if isinstance(heading_value, list) else json.loads(str(heading_value))
     return RetrievalHit(
         chunk_id=str(row["chunk_id"]),
         parent_chunk_id=(
@@ -926,24 +924,16 @@ def _hit_from_row(row: dict[str, object]) -> RetrievalHit:
         document_version_id=str(row["document_version_id"]),
         document_title=str(row["document_title"]),
         text=str(row["text"]),
-        page_numbers=tuple(
-            int(str(item)) for item in _object_sequence(row["page_numbers"])
-        ),
+        page_numbers=tuple(int(str(item)) for item in _object_sequence(row["page_numbers"])),
         citations=tuple(ChunkCitation.model_validate(item) for item in citations),
         language_code=str(row["language_code"]),
         languages=tuple(str(item) for item in _object_sequence(row["languages"])),
         script_code=str(row["script_code"]),
         heading_path=tuple(str(item) for item in heading),
-        section_number=(
-            str(row["section_number"]) if row["section_number"] is not None else None
-        ),
-        clause_number=(
-            str(row["clause_number"]) if row["clause_number"] is not None else None
-        ),
+        section_number=(str(row["section_number"]) if row["section_number"] is not None else None),
+        clause_number=(str(row["clause_number"]) if row["clause_number"] is not None else None),
         translation_group_id=(
-            str(row["translation_group_id"])
-            if row["translation_group_id"] is not None
-            else None
+            str(row["translation_group_id"]) if row["translation_group_id"] is not None else None
         ),
         authoritative_language=(
             str(row["authoritative_language"])

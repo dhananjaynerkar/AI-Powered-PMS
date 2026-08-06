@@ -17,8 +17,11 @@ from pms_common.security import AuthorizationContext, Classification, apply_post
 from sqlalchemy import Connection, text
 
 from pms_case_workflow.chat_models import (
+    ChatAccessMode,
     ChatAttachment,
     ChatCitation,
+    ChatHandoffAction,
+    ChatHandoffEvent,
     ChatIngestionStatus,
     ChatMemory,
     ChatMessage,
@@ -52,11 +55,27 @@ class ChatStore(Protocol):
 
     def list_messages(self, chat_id: str) -> tuple[ChatMessage, ...]: ...
 
+    def get_message_by_idempotency(
+        self, chat_id: str, idempotency_key: str
+    ) -> ChatMessage | None: ...
+
     def list_citations(self, message_id: str) -> tuple[ChatCitation, ...]: ...
 
     def list_attachments(self, chat_id: str) -> tuple[ChatAttachment, ...]: ...
 
     def add_participant(self, participant: ChatParticipant) -> None: ...
+
+    def list_participants(self, chat_id: str) -> tuple[ChatParticipant, ...]: ...
+
+    def list_handoff_events(self, chat_id: str) -> tuple[ChatHandoffEvent, ...]: ...
+
+    def apply_handoff(
+        self,
+        event: ChatHandoffEvent,
+        *,
+        recipient: ChatParticipant,
+        case_id: str | None = None,
+    ) -> ChatRecord: ...
 
     def append_message(
         self,
@@ -71,6 +90,8 @@ class ChatStore(Protocol):
         route: str | None = None,
         review_required: bool = False,
         created_at: datetime,
+        message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> ChatMessage: ...
 
     def update_message_status(
@@ -85,6 +106,8 @@ class ChatStore(Protocol):
     def add_citations(self, citations: Iterable[ChatCitation]) -> None: ...
 
     def add_attachment(self, attachment: ChatAttachment) -> None: ...
+
+    def remove_attachment(self, attachment_id: str) -> None: ...
 
     def update_attachment(
         self,
@@ -108,6 +131,7 @@ def _chat_from_row(row: Mapping[Any, Any]) -> ChatRecord:
     return ChatRecord(
         chat_id=str(row["chat_id"]),
         owner_subject=str(row["owner_subject"]),
+        current_owner_subject=str(row["current_owner_subject"]),
         title=str(row["title"]),
         chat_type=ChatType(str(row["chat_type"])),
         status=ChatStatus(str(row["status"])),
@@ -135,6 +159,7 @@ def _message_from_row(row: Mapping[Any, Any]) -> ChatMessage:
         review_required=bool(row["review_required"]),
         completed_at=row["completed_at"],
         failure_reason=row["failure_reason"],
+        idempotency_key=row["idempotency_key"],
     )
 
 
@@ -152,14 +177,17 @@ class PostgresChatStore:
         self._connection.execute(
             text(
                 "INSERT INTO pms_chat.chat "
-                "(chat_id, owner_subject, owner_admin_id, title, chat_type, status, case_id, "
+                "(chat_id, owner_subject, current_owner_subject, owner_admin_id, "
+                "title, chat_type, status, case_id, "
                 "created_at, updated_at, last_message_at) VALUES "
-                "(:chat_id, :owner_subject, :owner_admin_id, :title, :chat_type, :status, "
+                "(:chat_id, :owner_subject, :current_owner_subject, :owner_admin_id, "
+                ":title, :chat_type, :status, "
                 ":case_id, :created_at, :updated_at, :last_message_at)"
             ),
             {
                 "chat_id": chat.chat_id,
                 "owner_subject": chat.owner_subject,
+                "current_owner_subject": chat.current_owner_subject or chat.owner_subject,
                 "owner_admin_id": chat.owner_admin_id,
                 "title": chat.title,
                 "chat_type": chat.chat_type.value,
@@ -170,6 +198,7 @@ class PostgresChatStore:
                 "last_message_at": chat.last_message_at,
             },
         )
+
         self.add_participant(owner)
         self._connection.execute(
             text(
@@ -181,21 +210,27 @@ class PostgresChatStore:
         )
 
     def get_chat(self, chat_id: str) -> ChatRecord | None:
-        row = self._connection.execute(
-            text(
-                "SELECT chat_id, owner_subject, owner_admin_id, title, chat_type, status, "
-                "case_id, created_at, updated_at, last_message_at "
-                "FROM pms_chat.chat WHERE chat_id = :chat_id"
-            ),
-            {"chat_id": chat_id},
-        ).mappings().one_or_none()
+        row = (
+            self._connection.execute(
+                text(
+                    "SELECT chat_id, owner_subject, current_owner_subject, owner_admin_id, "
+                    "title, chat_type, status, "
+                    "case_id, created_at, updated_at, last_message_at "
+                    "FROM pms_chat.chat WHERE chat_id = :chat_id"
+                ),
+                {"chat_id": chat_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
         return _chat_from_row(row) if row is not None else None
 
     def list_chats(self, *, include_archived: bool = False) -> tuple[ChatRecord, ...]:
         status_filter = "" if include_archived else "WHERE status <> :archived_status"
         rows = self._connection.execute(
             text(
-                "SELECT chat_id, owner_subject, owner_admin_id, title, chat_type, status, "
+                "SELECT chat_id, owner_subject, current_owner_subject, owner_admin_id, "
+                "title, chat_type, status, "
                 "case_id, created_at, updated_at, last_message_at "
                 f"FROM pms_chat.chat {status_filter} ORDER BY updated_at DESC, chat_id"
             ),
@@ -236,17 +271,175 @@ class PostgresChatStore:
     def archive_chat(self, chat_id: str) -> ChatRecord:
         return self.update_chat(chat_id, status=ChatStatus.ARCHIVED)
 
+    def list_participants(self, chat_id: str) -> tuple[ChatParticipant, ...]:
+        rows = self._connection.execute(
+            text(
+                "SELECT chat_id, participant_subject, participant_admin_id, participant_role, "
+                "access_mode, added_by_subject, added_at, removed_at "
+                "FROM pms_chat.chat_participant WHERE chat_id = :chat_id "
+                "AND removed_at IS NULL ORDER BY added_at, participant_subject"
+            ),
+            {"chat_id": chat_id},
+        ).mappings()
+        return tuple(
+            ChatParticipant(
+                chat_id=str(row["chat_id"]),
+                participant_subject=str(row["participant_subject"]),
+                participant_admin_id=row["participant_admin_id"],
+                participant_role=str(row["participant_role"]),
+                access_mode=ChatAccessMode(str(row["access_mode"])),
+                added_by_subject=str(row["added_by_subject"]),
+                added_at=row["added_at"],
+                removed_at=row["removed_at"],
+            )
+            for row in rows
+        )
+
+    def list_handoff_events(self, chat_id: str) -> tuple[ChatHandoffEvent, ...]:
+        rows = self._connection.execute(
+            text(
+                "SELECT event_id, chat_id, actor_subject, actor_admin_id, actor_role, "
+                "recipient_subject, recipient_admin_id, recipient_role, action, remarks, "
+                "created_at "
+                "FROM pms_chat.chat_handoff_event WHERE chat_id = :chat_id "
+                "ORDER BY created_at, event_id"
+            ),
+            {"chat_id": chat_id},
+        ).mappings()
+        return tuple(
+            ChatHandoffEvent(
+                event_id=str(row["event_id"]),
+                chat_id=str(row["chat_id"]),
+                actor_subject=str(row["actor_subject"]),
+                actor_admin_id=row["actor_admin_id"],
+                actor_role=str(row["actor_role"]),
+                recipient_subject=str(row["recipient_subject"]),
+                recipient_admin_id=row["recipient_admin_id"],
+                recipient_role=str(row["recipient_role"]),
+                action=ChatHandoffAction(str(row["action"])),
+                remarks=str(row["remarks"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        )
+
+    def apply_handoff(
+        self,
+        event: ChatHandoffEvent,
+        *,
+        recipient: ChatParticipant,
+        case_id: str | None = None,
+    ) -> ChatRecord:
+        current = (
+            self._connection.execute(
+                text(
+                    "SELECT chat_id, owner_subject, current_owner_subject, owner_admin_id, title, "
+                    "chat_type, status, case_id, created_at, updated_at, last_message_at "
+                    "FROM pms_chat.chat WHERE chat_id = :chat_id FOR UPDATE"
+                ),
+                {"chat_id": event.chat_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if current is None:
+            raise LookupError("chat is unavailable")
+        if str(current["current_owner_subject"]) != event.actor_subject:
+            raise PermissionError("only the current chat owner may hand off this chat")
+        if (
+            event.chat_id != recipient.chat_id
+            or recipient.participant_subject != event.recipient_subject
+        ):
+            raise ValueError("handoff recipient does not match event")
+        if (
+            event.action is ChatHandoffAction.SHARE
+            and str(current["chat_type"]) == ChatType.PERSONAL.value
+        ):
+            if case_id is None:
+                raise ValueError("sharing a personal chat requires a case_id")
+            self._connection.execute(
+                text(
+                    "UPDATE pms_chat.chat SET chat_type = :chat_type, case_id = :case_id "
+                    "WHERE chat_id = :chat_id"
+                ),
+                {
+                    "chat_id": event.chat_id,
+                    "chat_type": ChatType.SHARED_CASE.value,
+                    "case_id": case_id,
+                },
+            )
+        elif case_id is not None and str(current["case_id"] or "") != case_id:
+            raise ValueError("a shared chat cannot change its linked case")
+        self.add_participant(recipient)
+        self._connection.execute(
+            text(
+                "UPDATE pms_chat.chat SET current_owner_subject = :recipient, "
+                "updated_at = :updated_at "
+                "WHERE chat_id = :chat_id"
+            ),
+            {
+                "chat_id": event.chat_id,
+                "recipient": event.recipient_subject,
+                "updated_at": event.created_at,
+            },
+        )
+        self._connection.execute(
+            text(
+                "INSERT INTO pms_chat.chat_handoff_event "
+                "(event_id, chat_id, actor_subject, actor_admin_id, actor_role, recipient_subject, "
+                "recipient_admin_id, recipient_role, action, remarks, created_at) VALUES "
+                "(:event_id, :chat_id, :actor_subject, :actor_admin_id, :actor_role, "
+                ":recipient_subject, "
+                ":recipient_admin_id, :recipient_role, :action, :remarks, :created_at)"
+            ),
+            {
+                "event_id": event.event_id,
+                "chat_id": event.chat_id,
+                "actor_subject": event.actor_subject,
+                "actor_admin_id": event.actor_admin_id,
+                "actor_role": event.actor_role,
+                "recipient_subject": event.recipient_subject,
+                "recipient_admin_id": event.recipient_admin_id,
+                "recipient_role": event.recipient_role,
+                "action": event.action.value,
+                "remarks": event.remarks,
+                "created_at": event.created_at,
+            },
+        )
+        updated = self.get_chat(event.chat_id)
+        if updated is None:
+            raise LookupError("chat is unavailable")
+        return updated
+
     def list_messages(self, chat_id: str) -> tuple[ChatMessage, ...]:
         rows = self._connection.execute(
             text(
                 "SELECT message_id, chat_id, sequence_number, sender_subject, sender_admin_id, "
                 "message_role, content, message_status, model_name, route, review_required, "
-                "created_at, completed_at, failure_reason FROM pms_chat.chat_message "
+                "created_at, completed_at, failure_reason, idempotency_key "
+                "FROM pms_chat.chat_message "
                 "WHERE chat_id = :chat_id ORDER BY sequence_number"
             ),
             {"chat_id": chat_id},
         ).mappings()
         return tuple(_message_from_row(row) for row in rows)
+
+    def get_message_by_idempotency(self, chat_id: str, idempotency_key: str) -> ChatMessage | None:
+        row = (
+            self._connection.execute(
+                text(
+                    "SELECT message_id, chat_id, sequence_number, sender_subject, sender_admin_id, "
+                    "message_role, content, message_status, model_name, route, review_required, "
+                    "created_at, completed_at, failure_reason, idempotency_key "
+                    "FROM pms_chat.chat_message WHERE chat_id = :chat_id "
+                    "AND idempotency_key = :idempotency_key"
+                ),
+                {"chat_id": chat_id, "idempotency_key": idempotency_key},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return _message_from_row(row) if row is not None else None
 
     def list_citations(self, message_id: str) -> tuple[ChatCitation, ...]:
         rows = self._connection.execute(
@@ -281,7 +474,7 @@ class PostgresChatStore:
                 "SELECT attachment_id, chat_id, uploaded_by_subject, uploaded_by_admin_id, "
                 "canonical_document_id, original_filename, checksum_sha256, mime_type, size_bytes, "
                 "ingestion_status, classification, created_at, ready_at, failure_reason, "
-                "review_reason "
+                "review_reason, ingestion_job_id "
                 "FROM pms_chat.chat_attachment WHERE chat_id = :chat_id "
                 "ORDER BY created_at, attachment_id"
             ),
@@ -304,6 +497,7 @@ class PostgresChatStore:
                 ready_at=row["ready_at"],
                 failure_reason=row["failure_reason"],
                 review_reason=row["review_reason"],
+                ingestion_job_id=row["ingestion_job_id"],
             )
             for row in rows
         )
@@ -337,19 +531,20 @@ class PostgresChatStore:
         # Updating the parent row takes a row lock, making MAX()+1 safe for
         # concurrent messages in the same chat within the surrounding transaction.
         self._connection.execute(
-            text(
-                "UPDATE pms_chat.chat SET updated_at = updated_at "
-                "WHERE chat_id = :chat_id"
-            ),
+            text("UPDATE pms_chat.chat SET updated_at = updated_at WHERE chat_id = :chat_id"),
             {"chat_id": chat_id},
         )
-        row = self._connection.execute(
-            text(
-                "SELECT COALESCE(MAX(sequence_number), 0) + 1 AS next_sequence "
-                "FROM pms_chat.chat_message WHERE chat_id = :chat_id"
-            ),
-            {"chat_id": chat_id},
-        ).mappings().one()
+        row = (
+            self._connection.execute(
+                text(
+                    "SELECT COALESCE(MAX(sequence_number), 0) + 1 AS next_sequence "
+                    "FROM pms_chat.chat_message WHERE chat_id = :chat_id"
+                ),
+                {"chat_id": chat_id},
+            )
+            .mappings()
+            .one()
+        )
         return int(row["next_sequence"])
 
     def append_message(
@@ -365,11 +560,17 @@ class PostgresChatStore:
         route: str | None = None,
         review_required: bool = False,
         created_at: datetime,
+        message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> ChatMessage:
         if not content.strip():
             raise ValueError("chat message content cannot be empty")
+        if idempotency_key is not None:
+            existing = self.get_message_by_idempotency(chat_id, idempotency_key)
+            if existing is not None:
+                return existing
         message = ChatMessage(
-            message_id=str(uuid4()),
+            message_id=message_id or str(uuid4()),
             chat_id=chat_id,
             sequence_number=self._next_sequence(chat_id),
             sender_subject=sender_subject,
@@ -381,15 +582,17 @@ class PostgresChatStore:
             route=route,
             review_required=review_required,
             created_at=created_at,
+            idempotency_key=idempotency_key,
         )
         self._connection.execute(
             text(
                 "INSERT INTO pms_chat.chat_message "
                 "(message_id, chat_id, sequence_number, sender_subject, sender_admin_id, "
                 "message_role, content, message_status, model_name, route, review_required, "
-                "created_at) VALUES (:message_id, :chat_id, :sequence_number, :sender, "
+                "created_at, idempotency_key) VALUES "
+                "(:message_id, :chat_id, :sequence_number, :sender, "
                 ":sender_admin_id, :role, :content, :status, :model, :route, :review_required, "
-                ":created_at)"
+                ":created_at, :idempotency_key)"
             ),
             {
                 "message_id": message.message_id,
@@ -404,6 +607,7 @@ class PostgresChatStore:
                 "route": message.route,
                 "review_required": message.review_required,
                 "created_at": message.created_at,
+                "idempotency_key": message.idempotency_key,
             },
         )
         self._connection.execute(
@@ -472,10 +676,11 @@ class PostgresChatStore:
                 "(attachment_id, chat_id, uploaded_by_subject, uploaded_by_admin_id, "
                 "canonical_document_id, original_filename, checksum_sha256, mime_type, size_bytes, "
                 "ingestion_status, classification, created_at, ready_at, failure_reason, "
-                "review_reason) "
+                "review_reason, ingestion_job_id) "
                 "VALUES (:attachment_id, :chat_id, :uploaded_by, :uploaded_by_admin_id, "
                 ":document_id, :filename, :checksum, :mime_type, :size_bytes, :status, "
-                ":classification, :created_at, :ready_at, :failure_reason, :review_reason) "
+                ":classification, :created_at, :ready_at, :failure_reason, "
+                ":review_reason, :job_id) "
                 "ON CONFLICT (chat_id, checksum_sha256) DO NOTHING"
             ),
             {
@@ -494,6 +699,7 @@ class PostgresChatStore:
                 "ready_at": attachment.ready_at,
                 "failure_reason": attachment.failure_reason,
                 "review_reason": attachment.review_reason,
+                "job_id": attachment.ingestion_job_id,
             },
         )
 
@@ -525,6 +731,12 @@ class PostgresChatStore:
             },
         )
 
+    def remove_attachment(self, attachment_id: str) -> None:
+        self._connection.execute(
+            text("DELETE FROM pms_chat.chat_attachment WHERE attachment_id = :attachment_id"),
+            {"attachment_id": attachment_id},
+        )
+
     def upsert_memory(self, memory: ChatMemory) -> None:
         self._connection.execute(
             text(
@@ -545,13 +757,18 @@ class PostgresChatStore:
         )
 
     def get_memory(self, chat_id: str) -> ChatMemory | None:
-        row = self._connection.execute(
-            text(
-                "SELECT chat_id, summary, last_summarized_sequence, summary_version, updated_at "
-                "FROM pms_chat.chat_memory WHERE chat_id = :chat_id"
-            ),
-            {"chat_id": chat_id},
-        ).mappings().one_or_none()
+        row = (
+            self._connection.execute(
+                text(
+                    "SELECT chat_id, summary, last_summarized_sequence, summary_version, "
+                    "updated_at "
+                    "FROM pms_chat.chat_memory WHERE chat_id = :chat_id"
+                ),
+                {"chat_id": chat_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             return None
         return ChatMemory(

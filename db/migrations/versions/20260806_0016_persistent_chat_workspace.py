@@ -159,6 +159,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("failure_reason", sa.Text(), nullable=True),
+        sa.Column("idempotency_key", sa.Text(), nullable=True),
         _check("message_role", MESSAGE_ROLES, "ck_chat_message_role"),
         _check("message_status", MESSAGE_STATUSES, "ck_chat_message_status"),
         sa.CheckConstraint("sequence_number >= 1", name="ck_chat_message_sequence"),
@@ -171,6 +172,11 @@ def upgrade() -> None:
             "chat_id",
             "sequence_number",
             name="uq_chat_message_chat_sequence",
+        ),
+        sa.UniqueConstraint(
+            "chat_id",
+            "idempotency_key",
+            name="uq_chat_message_idempotency",
         ),
         schema=SCHEMA,
     )

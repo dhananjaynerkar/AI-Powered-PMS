@@ -215,6 +215,8 @@ class Settings(BaseSettings):
     embedding_store_text: bool = True
     embedding_fail_fast: bool = False
     embedding_max_retries: int = Field(default=2, ge=0, le=2)
+    query_embedding_cache_max_entries: int = Field(default=256, ge=1, le=4096)
+    query_embedding_cache_ttl_seconds: int = Field(default=900, ge=1, le=86400)
 
     vector_backend: Literal["pgvector"] = "pgvector"
     vector_distance: Literal["cosine"] = "cosine"
@@ -645,6 +647,8 @@ class Settings(BaseSettings):
             "embedding_store_text": self.embedding_store_text,
             "embedding_fail_fast": self.embedding_fail_fast,
             "embedding_max_retries": self.embedding_max_retries,
+            "query_embedding_cache_max_entries": self.query_embedding_cache_max_entries,
+            "query_embedding_cache_ttl_seconds": self.query_embedding_cache_ttl_seconds,
             "vector_backend": self.vector_backend,
             "vector_distance": self.vector_distance,
             "vector_index_mode": self.vector_index_mode,

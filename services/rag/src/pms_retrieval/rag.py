@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
-from collections.abc import Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date
+from threading import Lock
 from typing import Literal, Protocol, cast
 
 from pms_common.logging import get_request_id
@@ -66,6 +69,63 @@ class QueryEmbedder(Protocol):
     def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]: ...
 
 
+class AuthorizationSafeQueryEmbeddingCache:
+    """A bounded process-local cache that never crosses authorization scopes."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._max_entries = settings.query_embedding_cache_max_entries
+        self._ttl_seconds = settings.query_embedding_cache_ttl_seconds
+        self._entries: OrderedDict[str, tuple[float, tuple[float, ...]]] = OrderedDict()
+        self._lock = Lock()
+
+    def get_or_embed(
+        self,
+        embedder: QueryEmbedder,
+        normalized_query: str,
+        context: AuthorizationContext,
+    ) -> tuple[tuple[float, ...], bool]:
+        key = self._key(embedder, normalized_query, context)
+        now = time.monotonic()
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is not None and cached[0] > now:
+                self._entries.move_to_end(key)
+                return cached[1], True
+            self._entries.pop(key, None)
+
+        vectors = embedder.embed((normalized_query,))
+        if len(vectors) != 1:
+            raise GenerationError("query embedding count is invalid")
+        vector = vectors[0]
+        with self._lock:
+            self._entries[key] = (now + self._ttl_seconds, vector)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return vector, False
+
+    @staticmethod
+    def _key(
+        embedder: QueryEmbedder,
+        normalized_query: str,
+        context: AuthorizationContext,
+    ) -> str:
+        authorization_scope = "\x1f".join(
+            (
+                context.subject,
+                ",".join(sorted(role.value for role in context.roles)),
+                context.tenant_id or "",
+                context.department_id or "",
+                context.unit_id or "",
+                context.classification.value,
+            )
+        )
+        material = "\x1e".join(
+            (embedder.model, embedder.revision, normalized_query, authorization_scope)
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 class RagRepository(Protocol):
     def lexical_search(
         self,
@@ -74,6 +134,7 @@ class RagRepository(Protocol):
         *,
         as_of_date: date,
         document_pattern: str | None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]: ...
 
     def dense_search(
@@ -85,6 +146,7 @@ class RagRepository(Protocol):
         limit: int,
         as_of_date: date,
         document_pattern: str | None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]: ...
 
     def parent_chunks(
@@ -125,6 +187,7 @@ class PostgresRagRepository:
         *,
         as_of_date: date,
         document_pattern: str | None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]:
         with self._engine.begin() as connection:
             return PostgresChunkRepository(connection, self._context).lexical_search(
@@ -132,6 +195,7 @@ class PostgresRagRepository:
                 limit,
                 as_of_date=as_of_date,
                 document_pattern=document_pattern,
+                additional_document_ids=additional_document_ids,
             )
 
     def dense_search(
@@ -143,6 +207,7 @@ class PostgresRagRepository:
         limit: int,
         as_of_date: date,
         document_pattern: str | None,
+        additional_document_ids: Sequence[str] = (),
     ) -> tuple[RetrievalHit, ...]:
         with self._engine.begin() as connection:
             return PostgresChunkRepository(
@@ -155,6 +220,7 @@ class PostgresRagRepository:
                 limit=limit,
                 as_of_date=as_of_date,
                 document_pattern=document_pattern,
+                additional_document_ids=additional_document_ids,
             )
 
     def parent_chunks(
@@ -214,6 +280,7 @@ class HybridRagService:
         reranker: EvidenceReranker | None = None,
         generator: DraftGenerator | None = None,
         tokenizer: Tokenizer | None = None,
+        query_embedding_cache: AuthorizationSafeQueryEmbeddingCache | None = None,
     ) -> None:
         AuthorizationService().require_permission(context, Permission.DOCUMENT_SEARCH)
         self._repository = repository
@@ -223,6 +290,9 @@ class HybridRagService:
         self._reranker = reranker or BgeReranker(settings)
         self._generator = generator or OllamaGenerator(settings)
         self._tokenizer = tokenizer or BgeM3Tokenizer(settings)
+        self._query_embedding_cache = query_embedding_cache or AuthorizationSafeQueryEmbeddingCache(
+            settings
+        )
 
     def corpus_status(self) -> CorpusStatus:
         return self._repository.corpus_status()
@@ -241,9 +311,12 @@ class HybridRagService:
         include_trace: bool = False,
         today: date | None = None,
         lexical_only: bool = False,
+        on_token: Callable[[str], None] | None = None,
+        additional_document_ids: Sequence[str] = (),
+        initial_stage_durations_ms: Mapping[str, float] | None = None,
     ) -> GroundedAnswer:
         started = time.perf_counter()
-        durations: dict[str, float] = {}
+        durations: dict[str, float] = dict(initial_stage_durations_ms or {})
         understanding = understand_query(
             query,
             today=today,
@@ -255,19 +328,37 @@ class HybridRagService:
             understanding.normalized_query,
             maximum_length=self._settings.query_max_length,
         )
-        lexical = self._repository.lexical_search(
-            lexical_query,
-            self._settings.lexical_top_k,
-            as_of_date=understanding.as_of_date,
-            document_pattern=None,
-        )
-        if not lexical:
+        if additional_document_ids:
+            lexical = self._repository.lexical_search(
+                lexical_query,
+                self._settings.lexical_top_k,
+                as_of_date=understanding.as_of_date,
+                document_pattern=None,
+                additional_document_ids=additional_document_ids,
+            )
+        else:
             lexical = self._repository.lexical_search(
                 lexical_query,
                 self._settings.lexical_top_k,
                 as_of_date=understanding.as_of_date,
                 document_pattern=None,
             )
+        if not lexical:
+            if additional_document_ids:
+                lexical = self._repository.lexical_search(
+                    lexical_query,
+                    self._settings.lexical_top_k,
+                    as_of_date=understanding.as_of_date,
+                    document_pattern=None,
+                    additional_document_ids=additional_document_ids,
+                )
+            else:
+                lexical = self._repository.lexical_search(
+                    lexical_query,
+                    self._settings.lexical_top_k,
+                    as_of_date=understanding.as_of_date,
+                    document_pattern=None,
+                )
         durations["lexical"] = _elapsed_ms(stage)
 
         dense: tuple[RetrievalHit, ...] = ()
@@ -280,20 +371,38 @@ class HybridRagService:
                 limit=self._settings.rerank_input_top_k,
             )
             reranked = fused[: self._settings.rerank_output_top_k]
-            durations["dense"] = 0.0
+            durations["query_embedding"] = 0.0
+            durations["query_embedding_cache_hit"] = 0.0
+            durations["vector_search"] = 0.0
         else:
-            query_vectors = self._embedder.embed((understanding.normalized_query,))
-            if len(query_vectors) != 1:
-                raise GenerationError("query embedding count is invalid")
-            dense = self._repository.dense_search(
-                query_vectors[0],
-                model=self._embedder.model,
-                revision=self._embedder.revision,
-                limit=self._settings.dense_top_k,
-                as_of_date=understanding.as_of_date,
-                document_pattern=None,
+            query_vector, cache_hit = self._query_embedding_cache.get_or_embed(
+                self._embedder,
+                understanding.normalized_query,
+                self._context,
             )
-            durations["dense"] = _elapsed_ms(stage)
+            durations["query_embedding"] = _elapsed_ms(stage)
+            durations["query_embedding_cache_hit"] = 1.0 if cache_hit else 0.0
+            stage = time.perf_counter()
+            if additional_document_ids:
+                dense = self._repository.dense_search(
+                    query_vector,
+                    model=self._embedder.model,
+                    revision=self._embedder.revision,
+                    limit=self._settings.dense_top_k,
+                    as_of_date=understanding.as_of_date,
+                    document_pattern=None,
+                    additional_document_ids=additional_document_ids,
+                )
+            else:
+                dense = self._repository.dense_search(
+                    query_vector,
+                    model=self._embedder.model,
+                    revision=self._embedder.revision,
+                    limit=self._settings.dense_top_k,
+                    as_of_date=understanding.as_of_date,
+                    document_pattern=None,
+                )
+            durations["vector_search"] = _elapsed_ms(stage)
             stage = time.perf_counter()
             fused = reciprocal_rank_fusion(
                 lexical,
@@ -301,6 +410,8 @@ class HybridRagService:
                 k=self._settings.rrf_k,
                 limit=self._settings.rerank_input_top_k,
             )
+            durations["fusion"] = _elapsed_ms(stage)
+            stage = time.perf_counter()
             reranked = self._reranker.rerank(
                 understanding.normalized_query,
                 fused,
@@ -315,7 +426,11 @@ class HybridRagService:
                 if item.rerank_score is not None
                 and item.rerank_score >= self._settings.retrieval_min_score
             )
-        durations["fusion_rerank"] = _elapsed_ms(stage)
+        if lexical_only:
+            durations["fusion"] = _elapsed_ms(stage)
+            durations["reranking"] = 0.0
+        else:
+            durations["reranking"] = _elapsed_ms(stage)
 
         stage = time.perf_counter()
         context = self._build_context(reranked, understanding.as_of_date)
@@ -351,7 +466,21 @@ class HybridRagService:
 
         warnings = list(_context_warnings(context))
         stage = time.perf_counter()
-        draft, fallback_used = self._generate(understanding, context)
+        first_token_recorded = False
+
+        def timed_token(delta: str) -> None:
+            nonlocal first_token_recorded
+            if not first_token_recorded:
+                durations["first_generated_token"] = _elapsed_ms(stage)
+                first_token_recorded = True
+            if on_token is not None:
+                on_token(delta)
+
+        draft, fallback_used = self._generate(
+            understanding,
+            context,
+            on_token=timed_token if on_token is not None else None,
+        )
         durations["generation"] = _elapsed_ms(stage)
         durations["citation_validation"] = draft.citation_validation_ms
         durations["total"] = _elapsed_ms(started)
@@ -370,9 +499,7 @@ class HybridRagService:
         if draft.review_required:
             result = self._refusal(understanding, "GENERATION_REVIEW_REQUIRED").model_copy(
                 update={
-                    "warnings": tuple(
-                        dict.fromkeys(("GENERATION_REVIEW_REQUIRED", *warnings))
-                    ),
+                    "warnings": tuple(dict.fromkeys(("GENERATION_REVIEW_REQUIRED", *warnings))),
                     "model": draft.model,
                     "trace": trace if self._trace_allowed(include_trace) else None,
                 }
@@ -518,14 +645,26 @@ class HybridRagService:
         self,
         understanding: QueryUnderstanding,
         context: tuple[ContextEvidence, ...],
+        *,
+        on_token: Callable[[str], None] | None = None,
     ) -> tuple[GeneratedDraft, bool]:
         try:
-            primary = self._generator.generate(
-                understanding.normalized_query,
-                context,
-                response_language=understanding.response_language,
-                model=self._settings.llm_primary_model,
-            )
+            stream_generator = getattr(self._generator, "generate_stream", None)
+            if on_token is not None and callable(stream_generator):
+                primary = stream_generator(
+                    understanding.normalized_query,
+                    context,
+                    response_language=understanding.response_language,
+                    model=self._settings.llm_primary_model,
+                    on_token=on_token,
+                )
+            else:
+                primary = self._generator.generate(
+                    understanding.normalized_query,
+                    context,
+                    response_language=understanding.response_language,
+                    model=self._settings.llm_primary_model,
+                )
         except GenerationError:
             primary = None
         if primary is not None and not primary.review_required:
@@ -554,9 +693,7 @@ class HybridRagService:
                 ungrouped.append(item)
                 continue
             current = selected.get(group)
-            if current is None or _translation_preference(item) > _translation_preference(
-                current
-            ):
+            if current is None or _translation_preference(item) > _translation_preference(current):
                 selected[group] = item
         combined = (*ungrouped, *selected.values())
         return tuple(
@@ -569,6 +706,7 @@ class HybridRagService:
                 ),
             )
         )
+
     def _refusal(
         self,
         understanding: QueryUnderstanding,
@@ -629,11 +767,7 @@ def _source_citation(item: ContextEvidence) -> SourceCitation:
 
 
 def _context_warnings(context: tuple[ContextEvidence, ...]) -> tuple[str, ...]:
-    if any(
-        term in item.text.casefold()
-        for item in context
-        for term in _PROMPT_INJECTION_TERMS
-    ):
+    if any(term in item.text.casefold() for item in context for term in _PROMPT_INJECTION_TERMS):
         return ("UNTRUSTED_EVIDENCE_INSTRUCTION_IGNORED",)
     return ()
 

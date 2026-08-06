@@ -85,6 +85,7 @@ export type ChatStatus = "ACTIVE" | "ARCHIVED" | "CLOSED";
 export interface ChatSummary {
   chat_id: string;
   owner_subject: string;
+  current_owner_subject: string;
   title: string;
   chat_type: ChatType;
   status: ChatStatus;
@@ -140,12 +141,36 @@ export interface ChatAttachment {
   ready_at: string | null;
   failure_reason: string | null;
   review_reason: string | null;
+  ingestion_job_id: string | null;
 }
 
 export interface ChatResponse extends ChatSummary {
   messages: ChatMessage[];
   attachments: ChatAttachment[];
   memory: { summary: string; last_summarized_sequence: number; summary_version: number; updated_at: string } | null;
+  participants: ChatParticipant[];
+  handoff_events: ChatHandoffEvent[];
+}
+
+export interface ChatParticipant {
+  participant_subject: string;
+  participant_admin_id: number | null;
+  participant_role: string;
+  access_mode: string;
+  added_by_subject: string;
+  added_at: string;
+}
+
+export interface ChatHandoffEvent {
+  event_id: string;
+  chat_id: string;
+  actor_subject: string;
+  actor_role: string;
+  recipient_subject: string;
+  recipient_role: string;
+  action: string;
+  remarks: string;
+  created_at: string;
 }
 
 export interface StaffRecipient {

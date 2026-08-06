@@ -19,11 +19,30 @@ from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Literal, Protocol, cast
+from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pms_case_workflow.chat_models import (
     ChatAccessMode,
+    ChatAttachment,
+    ChatCitation,
+    ChatHandoffAction,
+    ChatHandoffEvent,
+    ChatIngestionStatus,
+    ChatMessageRole,
+    ChatMessageStatus,
     ChatParticipant,
     ChatRecord,
     ChatStatus,
@@ -52,6 +71,7 @@ from pms_common.security import (
 from pms_common.settings import Settings
 from pms_context import ArtifactReference, ContextEngine, EvidenceReference
 from pms_ingestion.factory import create_document_service
+from pms_ingestion.parsing_service import DocumentParsingCoordinator
 from pms_ingestion.scanner import MalwareDetected, MalwareScannerError
 from pms_ingestion.service import (
     DocumentIntegrityError,
@@ -68,8 +88,13 @@ from pms_retrieval.embedding import (
 )
 from pms_retrieval.generation import GenerationError, OllamaGenerator
 from pms_retrieval.models import GroundedAnswer
-from pms_retrieval.rag import HybridRagService, PostgresRagRepository
+from pms_retrieval.rag import (
+    AuthorizationSafeQueryEmbeddingCache,
+    HybridRagService,
+    PostgresRagRepository,
+)
 from pms_retrieval.reranking import BgeReranker, RerankingError
+from pms_retrieval.service import RetrievalCoordinator
 from pms_rule_engine.engine import RuleCalculationEngine
 from pms_rule_engine.models import (
     CalculationResult,
@@ -122,8 +147,11 @@ from pms_api.schemas import (
     CaseResponse,
     ChatAttachmentResponse,
     ChatCitationResponse,
+    ChatHandoffEventResponse,
+    ChatHandoffRequest,
     ChatMemoryResponse,
     ChatMessageResponse,
+    ChatParticipantResponse,
     ChatResponse,
     ChatSummaryResponse,
     CreateCaseRequest,
@@ -151,6 +179,7 @@ from pms_api.semantic_demo import (
 from pms_api.staff_directory import (
     PostgresStaffDirectory,
     StaffDirectoryError,
+    StaffRecipient,
 )
 
 
@@ -216,7 +245,7 @@ class StaffDirectoryProvider(Protocol):
         context: AuthorizationContext,
         *,
         role: UserRole,
-    ) -> tuple[object, ...]: ...
+    ) -> tuple[StaffRecipient, ...]: ...
 
     def require_recipient(
         self,
@@ -224,7 +253,7 @@ class StaffDirectoryProvider(Protocol):
         *,
         role: UserRole,
         subject: str,
-    ) -> object: ...
+    ) -> StaffRecipient: ...
 
 
 class PostgresServiceProvider:
@@ -348,6 +377,7 @@ class PostgresRagServiceProvider:
         self._reranker: BgeReranker | None = None
         self._generator: OllamaGenerator | None = None
         self._tokenizer: BgeM3Tokenizer | None = None
+        self._query_embedding_cache = AuthorizationSafeQueryEmbeddingCache(settings)
 
     def _resources(
         self,
@@ -396,6 +426,7 @@ class PostgresRagServiceProvider:
             reranker=reranker,
             generator=generator,
             tokenizer=tokenizer,
+            query_embedding_cache=self._query_embedding_cache,
         )
 
 
@@ -433,6 +464,15 @@ def get_authorization_context(
 ) -> AuthorizationContext:
     """Validate a bearer header or the server-issued HttpOnly access cookie."""
 
+    started = time.perf_counter()
+
+    def authenticated(context: AuthorizationContext) -> AuthorizationContext:
+        request.state.authentication_duration_ms = round(
+            (time.perf_counter() - started) * 1000,
+            3,
+        )
+        return context
+
     token = None
     if credentials is not None and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
@@ -443,7 +483,7 @@ def get_authorization_context(
         if local_auth is not None:
             local_context = local_auth.authenticate(token)
             if local_context is not None:
-                return local_context
+                return authenticated(local_context)
     if token is None:
         local_auth = cast(
             LocalAuthService | None,
@@ -453,7 +493,7 @@ def get_authorization_context(
         if local_auth is not None and local_token:
             local_context = local_auth.authenticate(local_token)
             if local_context is not None:
-                return local_context
+                return authenticated(local_context)
         token = request.cookies.get("pms_access_token")
     if not token:
         demo_context = demo_context_from_session(
@@ -462,10 +502,10 @@ def get_authorization_context(
             client_host=request.client.host if request.client is not None else None,
         )
         if demo_context is not None:
-            return demo_context
+            return authenticated(demo_context)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
     try:
-        return _validator().validate(token)
+        return authenticated(_validator().validate(token))
     except AuthenticationError as error:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED) from error
 
@@ -815,15 +855,211 @@ def _sse_event(event: str, payload: object) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
 
 
+def _process_chat_attachment(
+    engine: Engine,
+    settings: Settings,
+    context: AuthorizationContext,
+    chat_id: str,
+    attachment_id: str,
+    document_id: str,
+) -> None:
+    """Run one persisted attachment job after the upload response is sent.
+
+    The attachment row is the durable checkpoint.  A process restart leaves the
+    row in its last state and the normal status endpoint never claims READY
+    until chunk ACLs and embeddings have been committed.
+    """
+
+    try:
+        with engine.begin() as connection:
+            store = PostgresChatStore(connection, context)
+            store.update_attachment(attachment_id, status=ChatIngestionStatus.PARSING)
+        parsed = DocumentParsingCoordinator(engine, context, settings).parse(document_id)
+        if parsed.review_required or not parsed.quality_passed:
+            with engine.begin() as connection:
+                PostgresChatStore(connection, context).update_attachment(
+                    attachment_id,
+                    status=ChatIngestionStatus.REVIEW_REQUIRED,
+                    review_reason=",".join(parsed.issue_codes) or "quality gate requires review",
+                )
+            return
+        with engine.begin() as connection:
+            PostgresChatStore(connection, context).update_attachment(
+                attachment_id,
+                status=ChatIngestionStatus.CHUNKING,
+            )
+        RetrievalCoordinator(engine, context, settings).chunk(document_id, resume=True)
+        with engine.begin() as connection:
+            PostgresChatStore(connection, context).update_attachment(
+                attachment_id,
+                status=ChatIngestionStatus.EMBEDDING,
+            )
+        RetrievalCoordinator(engine, context, settings).embed(
+            document_id,
+            dry_run=False,
+            resume=True,
+        )
+        with engine.begin() as connection:
+            PostgresChatStore(connection, context).update_attachment(
+                attachment_id,
+                status=ChatIngestionStatus.READY,
+                canonical_document_id=document_id,
+                ready_at=datetime.now(UTC),
+            )
+    except Exception as error:  # noqa: BLE001 - persist a bounded terminal state
+        with engine.begin() as connection:
+            PostgresChatStore(connection, context).update_attachment(
+                attachment_id,
+                status=ChatIngestionStatus.FAILED,
+                failure_reason=type(error).__name__,
+            )
+
+
+def _authorized_attachment_documents(
+    request: PolicyQueryRequest,
+    chat_store: ChatStore | None,
+    context: AuthorizationContext | None,
+) -> tuple[str, ...]:
+    """Resolve only READY attachments visible through the current chat."""
+
+    if not request.attachment_ids:
+        return ()
+    if chat_store is None or context is None or request.chat_id is None:
+        raise AuthorizationDenied("attachments require an authorized chat")
+    attachments = {
+        attachment.attachment_id: attachment
+        for attachment in chat_store.list_attachments(request.chat_id)
+    }
+    selected = []
+    for attachment_id in dict.fromkeys(request.attachment_ids):
+        attachment = attachments.get(attachment_id)
+        if attachment is None:
+            raise AuthorizationDenied("attachment is not available in this chat")
+        if attachment.ingestion_status is not ChatIngestionStatus.READY:
+            raise ValueError("attachment is not ready for retrieval")
+        if not attachment.canonical_document_id:
+            raise ValueError("attachment document is not ready")
+        selected.append(attachment.canonical_document_id)
+    return tuple(selected)
+
+
 def _stream_grounded_answer(
     request: PolicyQueryRequest,
     service: HybridRagService,
     release_lock: Callable[[], None],
+    chat_store: ChatStore | None = None,
+    context: AuthorizationContext | None = None,
+    authentication_duration_ms: float = 0.0,
 ) -> StreamingResponse:
-    """Stream safe progress while retaining final citation validation as a hard gate."""
+    """Stream a validated RAG answer and persist one idempotent final message."""
 
     async def events() -> AsyncIterator[str]:
+        assistant_key = f"{request.idempotency_key}:assistant" if request.idempotency_key else None
+        assistant_id = str(uuid4())
+
+        def persist_failure(
+            code: str,
+            message_status: ChatMessageStatus = ChatMessageStatus.FAILED,
+        ) -> None:
+            if chat_store is None or request.chat_id is None or context is None:
+                return
+            try:
+                chat_store.append_message(
+                    request.chat_id,
+                    sender_subject="assistant",
+                    role=ChatMessageRole.ASSISTANT,
+                    content="The assistant could not complete this request.",
+                    status=message_status,
+                    route="DOCUMENT",
+                    review_required=True,
+                    created_at=datetime.now(UTC),
+                    message_id=assistant_id,
+                    idempotency_key=assistant_key,
+                )
+                chat_store.update_message_status(
+                    assistant_id,
+                    status=message_status,
+                    completed_at=datetime.now(UTC),
+                    failure_reason=code,
+                )
+            except Exception:  # noqa: BLE001 - preserve the safe stream error
+                return
+
         try:
+            attachment_documents = _authorized_attachment_documents(request, chat_store, context)
+            if chat_store is not None and request.chat_id is not None and context is not None:
+                chat = chat_store.get_chat(request.chat_id)
+                if chat is None:
+                    yield _sse_event(
+                        "error",
+                        {
+                            "code": "CHAT_NOT_FOUND",
+                            "message": "This chat is unavailable.",
+                            "retryable": False,
+                        },
+                    )
+                    return
+                if assistant_key is not None:
+                    existing = chat_store.get_message_by_idempotency(request.chat_id, assistant_key)
+                    if (
+                        existing is not None
+                        and existing.message_status is ChatMessageStatus.COMPLETED
+                    ):
+                        stored_citations = chat_store.list_citations(existing.message_id)
+                        source_rows: dict[str, dict[str, object]] = {}
+                        for stored_citation in stored_citations:
+                            row = source_rows.setdefault(
+                                stored_citation.source_id,
+                                {
+                                    "source_id": stored_citation.source_id,
+                                    "document_id": stored_citation.canonical_document_id,
+                                    "document_version_id": stored_citation.document_version_id,
+                                    "document_title": stored_citation.canonical_document_id,
+                                    "page_numbers": [],
+                                    "section_number": stored_citation.section_number,
+                                    "clause_number": stored_citation.clause_number,
+                                    "citations": [],
+                                },
+                            )
+                            pages = cast(list[int], row["page_numbers"])
+                            if stored_citation.page_number not in pages:
+                                pages.append(stored_citation.page_number)
+                            cast(list[dict[str, object]], row["citations"]).append(
+                                {
+                                    "block_id": stored_citation.block_id,
+                                    "page_number": stored_citation.page_number,
+                                    "bounding_box": stored_citation.bounding_box,
+                                }
+                            )
+                        yield _sse_event("accepted", {"message_id": existing.message_id})
+                        yield _sse_event(
+                            "final",
+                            {
+                                "message_id": existing.message_id,
+                                "answer": existing.content,
+                                "sources": list(source_rows.values()),
+                                "warnings": [],
+                                "confidence": "LOW",
+                                "route": "DOCUMENT",
+                                "review_required": existing.review_required,
+                                "model": existing.model_name,
+                            },
+                        )
+                        return
+                user_key = request.idempotency_key or str(uuid4())
+                chat_store.append_message(
+                    request.chat_id,
+                    sender_subject=context.subject,
+                    role=ChatMessageRole.USER,
+                    content=request.question,
+                    status=ChatMessageStatus.COMPLETED,
+                    created_at=datetime.now(UTC),
+                    idempotency_key=user_key,
+                )
+                yield _sse_event("accepted", {"message_id": assistant_id})
+            else:
+                yield _sse_event("accepted", {"message_id": assistant_id})
+
             # These are coarse user-facing milestones only; no hidden model
             # reasoning, prompts, SQL or evidence text is streamed.
             for stage in (
@@ -834,25 +1070,139 @@ def _stream_grounded_answer(
                 "generating_answer",
             ):
                 yield _sse_event("status", {"stage": stage})
-            try:
-                result = await asyncio.to_thread(
-                    service.ask,
-                    request.question,
-                    response_language=request.response_language,
-                    include_trace=request.include_trace,
-                    today=request.as_of_date,
-                )
-            except AuthorizationDenied:
-                yield _sse_event("error", {"detail": "access denied"})
-                return
-            except GenerationError:
-                yield _sse_event(
-                    "error",
-                    {"detail": "document generation service is unavailable"},
-                )
-                return
+            token_queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def on_token(delta: str) -> None:
+                loop.call_soon_threadsafe(token_queue.put_nowait, ("token", delta))
+
+            async def run_query() -> None:
+                try:
+                    result = await asyncio.to_thread(
+                        service.ask,
+                        request.question,
+                        response_language=request.response_language,
+                        include_trace=request.include_trace,
+                        today=request.as_of_date,
+                        on_token=on_token,
+                        additional_document_ids=attachment_documents,
+                        initial_stage_durations_ms={
+                            "authentication": authentication_duration_ms,
+                        },
+                    )
+                    await token_queue.put(("result", result))
+                except Exception as error:  # noqa: BLE001 - converted to safe SSE below
+                    await token_queue.put(("error", error))
+
+            query_task = asyncio.create_task(run_query())
+            result: GroundedAnswer | None = None
+            query_error: Exception | None = None
+            while result is None and query_error is None:
+                kind, payload = await token_queue.get()
+                if kind == "token":
+                    yield _sse_event("token", {"delta": str(payload)})
+                elif kind == "result":
+                    result = cast(GroundedAnswer, payload)
+                else:
+                    query_error = cast(Exception, payload)
+            await query_task
+            if query_error is not None:
+                raise query_error
+            assert result is not None
             yield _sse_event("status", {"stage": "validating_citations"})
-            yield _sse_event("answer", result.model_dump(mode="json"))
+            if chat_store is not None and request.chat_id is not None and context is not None:
+                yield _sse_event("status", {"stage": "saving_response"})
+                stored = chat_store.append_message(
+                    request.chat_id,
+                    sender_subject="assistant",
+                    role=ChatMessageRole.ASSISTANT,
+                    content=result.answer,
+                    status=ChatMessageStatus.COMPLETED,
+                    model_name=result.model,
+                    route=result.route,
+                    review_required=result.review_required,
+                    created_at=datetime.now(UTC),
+                    message_id=assistant_id,
+                    idempotency_key=assistant_key,
+                )
+                completed_at = datetime.now(UTC)
+                chat_store.update_message_status(
+                    stored.message_id,
+                    status=ChatMessageStatus.COMPLETED,
+                    completed_at=completed_at,
+                )
+                citations: list[ChatCitation] = []
+                for source in result.sources:
+                    for citation in source.citations:
+                        citations.append(
+                            ChatCitation(
+                                citation_id=str(uuid4()),
+                                message_id=stored.message_id,
+                                source_id=source.source_id,
+                                canonical_document_id=source.document_id,
+                                document_version_id=source.document_version_id,
+                                page_number=citation.page_number,
+                                block_id=citation.block_id,
+                                section_number=source.section_number,
+                                clause_number=source.clause_number,
+                                bounding_box=(
+                                    citation.bounding_box.model_dump(mode="json")
+                                    if citation.bounding_box is not None
+                                    else None
+                                ),
+                                created_at=completed_at,
+                            )
+                        )
+                if citations:
+                    chat_store.add_citations(citations)
+                for stored_citation in citations:
+                    yield _sse_event(
+                        "citation",
+                        {
+                            "source_id": stored_citation.source_id,
+                            "page_numbers": [stored_citation.page_number],
+                        },
+                    )
+            yield _sse_event(
+                "final",
+                {
+                    "message_id": assistant_id,
+                    **result.model_dump(mode="json"),
+                },
+            )
+        except asyncio.CancelledError:
+            persist_failure("CANCELLED", ChatMessageStatus.CANCELLED)
+            raise
+        except AuthorizationDenied:
+            persist_failure("ACCESS_DENIED")
+            yield _sse_event(
+                "error",
+                {
+                    "code": "ACCESS_DENIED",
+                    "message": "Access to this evidence is denied.",
+                    "retryable": False,
+                },
+            )
+        except GenerationError:
+            persist_failure("GENERATION_UNAVAILABLE")
+            yield _sse_event(
+                "error",
+                {
+                    "code": "GENERATION_UNAVAILABLE",
+                    "message": "The document answer service is unavailable.",
+                    "retryable": True,
+                },
+            )
+        except Exception:  # noqa: BLE001 - never expose internals in the stream
+            persist_failure("ASSISTANT_REQUEST_FAILED")
+            yield _sse_event(
+                "error",
+                {
+                    "code": "ASSISTANT_REQUEST_FAILED",
+                    "message": "The assistant could not complete this request.",
+                    "retryable": True,
+                },
+            )
         finally:
             release_lock()
 
@@ -870,10 +1220,31 @@ def _chat_summary_response(chat: ChatRecord) -> ChatSummaryResponse:
         chat_type=chat.chat_type,
         status=chat.status,
         owner_subject=chat.owner_subject,
+        current_owner_subject=chat.current_owner_subject or chat.owner_subject,
         case_id=chat.case_id,
         created_at=chat.created_at,
         updated_at=chat.updated_at,
         last_message_at=chat.last_message_at,
+    )
+
+
+def _chat_attachment_response(attachment: ChatAttachment) -> ChatAttachmentResponse:
+    return ChatAttachmentResponse(
+        attachment_id=attachment.attachment_id,
+        chat_id=attachment.chat_id,
+        uploaded_by_subject=attachment.uploaded_by_subject,
+        canonical_document_id=attachment.canonical_document_id,
+        original_filename=attachment.original_filename,
+        checksum_sha256=attachment.checksum_sha256,
+        mime_type=attachment.mime_type,
+        size_bytes=attachment.size_bytes,
+        ingestion_status=attachment.ingestion_status.value,
+        classification=attachment.classification,
+        created_at=attachment.created_at,
+        ready_at=attachment.ready_at,
+        failure_reason=attachment.failure_reason,
+        review_reason=attachment.review_reason,
+        ingestion_job_id=attachment.ingestion_job_id,
     )
 
 
@@ -895,6 +1266,7 @@ def _chat_response(store: ChatStore, chat: ChatRecord) -> ChatResponse:
                 created_at=message.created_at,
                 completed_at=message.completed_at,
                 failure_reason=message.failure_reason,
+                idempotency_key=message.idempotency_key,
                 citations=tuple(
                     ChatCitationResponse(
                         citation_id=citation.citation_id,
@@ -918,22 +1290,7 @@ def _chat_response(store: ChatStore, chat: ChatRecord) -> ChatResponse:
         **_chat_summary_response(chat).model_dump(),
         messages=tuple(messages),
         attachments=tuple(
-            ChatAttachmentResponse(
-                attachment_id=attachment.attachment_id,
-                chat_id=attachment.chat_id,
-                uploaded_by_subject=attachment.uploaded_by_subject,
-                canonical_document_id=attachment.canonical_document_id,
-                original_filename=attachment.original_filename,
-                checksum_sha256=attachment.checksum_sha256,
-                mime_type=attachment.mime_type,
-                size_bytes=attachment.size_bytes,
-                ingestion_status=attachment.ingestion_status.value,
-                classification=attachment.classification,
-                created_at=attachment.created_at,
-                ready_at=attachment.ready_at,
-                failure_reason=attachment.failure_reason,
-                review_reason=attachment.review_reason,
-            )
+            _chat_attachment_response(attachment)
             for attachment in store.list_attachments(chat.chat_id)
         ),
         memory=(
@@ -946,6 +1303,39 @@ def _chat_response(store: ChatStore, chat: ChatRecord) -> ChatResponse:
             )
             if memory is not None
             else None
+        ),
+        participants=tuple(
+            ChatParticipantResponse(
+                participant_subject=item.participant_subject,
+                participant_admin_id=item.participant_admin_id,
+                participant_role=item.participant_role,
+                access_mode=item.access_mode.value,
+                added_by_subject=item.added_by_subject,
+                added_at=item.added_at,
+            )
+            for item in (
+                (store.list_participants(chat.chat_id) or ())
+                if hasattr(store, "list_participants")
+                else ()
+            )
+        ),
+        handoff_events=tuple(
+            ChatHandoffEventResponse(
+                event_id=item.event_id,
+                chat_id=item.chat_id,
+                actor_subject=item.actor_subject,
+                actor_role=item.actor_role,
+                recipient_subject=item.recipient_subject,
+                recipient_role=item.recipient_role,
+                action=item.action,
+                remarks=item.remarks,
+                created_at=item.created_at,
+            )
+            for item in (
+                (store.list_handoff_events(chat.chat_id) or ())
+                if hasattr(store, "list_handoff_events")
+                else ()
+            )
         ),
     )
 
@@ -996,6 +1386,7 @@ def create_app(
     app.state.demo_semantic_provider = demo_semantic_provider
     app.state.local_auth_service = local_auth_service
     app.state.staff_directory = staff_directory
+    app.state.attachment_worker = None
     app.state.upload_max_bytes = upload_max_bytes or Settings().upload_max_mb * 1024 * 1024
 
     @app.get("/auth/login", include_in_schema=False)
@@ -1293,11 +1684,13 @@ def create_app(
             )
         route, query_id = route_demo_question(request.question)
         if (
-            route in {DemoRoute.STRUCTURED_SQL, DemoRoute.COMBINED}
-            and structured_provider is None
-        ) or (
-            route in {DemoRoute.DOCUMENT_RAG, DemoRoute.COMBINED} and rag_provider is None
-        ) or (route is DemoRoute.SEMANTIC_QUERY and semantic_provider is None):
+            (
+                route in {DemoRoute.STRUCTURED_SQL, DemoRoute.COMBINED}
+                and structured_provider is None
+            )
+            or (route in {DemoRoute.DOCUMENT_RAG, DemoRoute.COMBINED} and rag_provider is None)
+            or (route is DemoRoute.SEMANTIC_QUERY and semantic_provider is None)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="controlled demo services are not configured",
@@ -1414,9 +1807,7 @@ def create_app(
                 ),
                 route=route,
                 principal=demo_principal(context),
-                warnings=(
-                    "NO_VERIFIED_EVIDENCE_RETURNED",
-                ),
+                warnings=("NO_VERIFIED_EVIDENCE_RETURNED",),
                 review_required=True,
                 correlation_id=get_request_id(),
                 duration_ms=duration_ms,
@@ -1516,6 +1907,12 @@ def create_app(
             )
         if chat_store is not None:
             lock_key = request.chat_id or context.subject
+            if request.chat_id is not None and chat_store.get_chat(request.chat_id) is None:
+                query_lock.release()
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="chat is unavailable",
+                )
             if not chat_store.try_acquire_generation_lock(lock_key):
                 query_lock.release()
                 raise HTTPException(
@@ -1531,13 +1928,27 @@ def create_app(
                 query_lock.release()
 
         if "text/event-stream" in raw_request.headers.get("accept", ""):
-            return _stream_grounded_answer(request, service, release_lock)
+            return _stream_grounded_answer(
+                request,
+                service,
+                release_lock,
+                chat_store,
+                context,
+                float(getattr(raw_request.state, "authentication_duration_ms", 0.0)),
+            )
         try:
+            attachment_documents = _authorized_attachment_documents(request, chat_store, context)
             return service.ask(
                 request.question,
                 response_language=request.response_language,
                 include_trace=request.include_trace,
                 today=request.as_of_date,
+                additional_document_ids=attachment_documents,
+                initial_stage_durations_ms={
+                    "authentication": float(
+                        getattr(raw_request.state, "authentication_duration_ms", 0.0)
+                    ),
+                },
             )
         except AuthorizationDenied as error:
             raise HTTPException(
@@ -1650,6 +2061,128 @@ def create_app(
             ) from error
 
     @app.post(
+        "/api/v1/assistant/chats/{chat_id}/attachments",
+        response_model=ChatAttachmentResponse,
+        status_code=201,
+    )
+    async def upload_chat_attachment(
+        chat_id: str,
+        background_tasks: BackgroundTasks,
+        file: Annotated[UploadFile, File()],
+        context: TrustedContext,
+        chat_store: ChatStoreDependency,
+        service: DocumentServiceDependency,
+    ) -> ChatAttachmentResponse:
+        """Upload one PDF and enqueue its bounded parse/chunk/embed job."""
+
+        if chat_store.get_chat(chat_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat is unavailable")
+        filename = (file.filename or "").strip()
+        if not filename.casefold().endswith(".pdf"):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="PDF attachments only"
+            )
+        content = await _read_bounded(file, app.state.upload_max_bytes)
+        if not content or not content.startswith(b"%PDF-"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="file is not a valid PDF"
+            )
+        if file.content_type not in {None, "", "application/pdf", "application/octet-stream"}:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="PDF MIME type required"
+            )
+        try:
+            uploaded = service.upload(
+                title=Path(filename).stem[:300],
+                filename=filename,
+                mime_type="application/pdf",
+                content=content,
+                classification=Classification.INTERNAL,
+            )
+        except (
+            AuthorizationDenied,
+            DocumentServiceError,
+            MalwareDetected,
+            MalwareScannerError,
+            ObjectStorageError,
+            UploadValidationError,
+            ValueError,
+        ) as error:
+            raise _document_error(error) from error
+        existing = next(
+            (
+                item
+                for item in chat_store.list_attachments(chat_id)
+                if item.checksum_sha256 == uploaded.document.checksum_sha256
+            ),
+            None,
+        )
+        if existing is not None:
+            return _chat_attachment_response(existing)
+        attachment_id = str(uuid4())
+        job_id = str(uuid4())
+        ready = uploaded.document.status == "indexed"
+        attachment = ChatAttachment(
+            attachment_id=attachment_id,
+            chat_id=chat_id,
+            uploaded_by_subject=context.subject,
+            uploaded_by_admin_id=None,
+            canonical_document_id=uploaded.document.canonical_document_id if ready else None,
+            original_filename=filename,
+            checksum_sha256=uploaded.document.checksum_sha256,
+            mime_type="application/pdf",
+            size_bytes=len(content),
+            ingestion_status=ChatIngestionStatus.READY if ready else ChatIngestionStatus.UPLOADED,
+            classification=Classification.INTERNAL,
+            created_at=datetime.now(UTC),
+            ready_at=datetime.now(UTC) if ready else None,
+            ingestion_job_id=None if ready else job_id,
+        )
+        chat_store.add_attachment(attachment)
+        if not ready:
+            worker = getattr(app.state, "attachment_worker", None)
+            if worker is not None:
+                background_tasks.add_task(
+                    worker,
+                    context,
+                    chat_id,
+                    attachment_id,
+                    uploaded.document.canonical_document_id,
+                )
+        return _chat_attachment_response(attachment)
+
+    @app.get(
+        "/api/v1/assistant/chats/{chat_id}/attachments",
+        response_model=tuple[ChatAttachmentResponse, ...],
+    )
+    def list_chat_attachments(
+        chat_id: str,
+        chat_store: ChatStoreDependency,
+    ) -> tuple[ChatAttachmentResponse, ...]:
+        if chat_store.get_chat(chat_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat is unavailable")
+        return tuple(
+            _chat_attachment_response(item) for item in chat_store.list_attachments(chat_id)
+        )
+
+    @app.delete("/api/v1/assistant/chats/{chat_id}/attachments/{attachment_id}", status_code=204)
+    def remove_chat_attachment(
+        chat_id: str,
+        attachment_id: str,
+        chat_store: ChatStoreDependency,
+    ) -> Response:
+        if chat_store.get_chat(chat_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat is unavailable")
+        if not any(
+            item.attachment_id == attachment_id for item in chat_store.list_attachments(chat_id)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="attachment is unavailable"
+            )
+        chat_store.remove_attachment(attachment_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
         "/api/v1/documents",
         response_model=DocumentUploadResponse,
         status_code=201,
@@ -1738,6 +2271,7 @@ def create_app(
         chat = ChatRecord(
             chat_id=str(secrets.token_urlsafe(24)),
             owner_subject=context.subject,
+            current_owner_subject=context.subject,
             title=request.title.strip(),
             chat_type=request.chat_type,
             status=ChatStatus.ACTIVE,
@@ -1799,6 +2333,135 @@ def create_app(
         if title is None and request.first_question is not None and current.title == "New Chat":
             title = title_from_first_question(request.first_question)
         updated = store.update_chat(chat_id, title=title, status=request.status)
+        return _chat_response(store, updated)
+
+    @app.post(
+        "/api/v1/assistant/chats/{chat_id}/handoff",
+        response_model=ChatResponse,
+    )
+    def handoff_chat(
+        chat_id: str,
+        request: ChatHandoffRequest,
+        context: TrustedContext,
+        store: ChatStoreDependency,
+        directory: StaffDirectoryDependency,
+    ) -> ChatResponse:
+        """Move the same persisted chat between eligible DO/NO/HOD users."""
+
+        chat = store.get_chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="chat not found")
+        staff_roles = (
+            UserRole.DATA_ENTRY_OPERATOR,
+            UserRole.NODAL_REGIONAL_OFFICER,
+            UserRole.HOD,
+        )
+        actor_role = next((role for role in staff_roles if role in context.roles), None)
+        if (
+            actor_role is None
+            or (chat.current_owner_subject or chat.owner_subject) != context.subject
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="chat handoff is not authorized"
+            )
+        target_by_action = {
+            ChatHandoffAction.SUBMIT_TO_NO: (
+                UserRole.DATA_ENTRY_OPERATOR,
+                UserRole.NODAL_REGIONAL_OFFICER,
+            ),
+            ChatHandoffAction.RETURN_TO_DO: (
+                UserRole.NODAL_REGIONAL_OFFICER,
+                UserRole.DATA_ENTRY_OPERATOR,
+            ),
+            ChatHandoffAction.FORWARD_TO_HOD: (
+                UserRole.NODAL_REGIONAL_OFFICER,
+                UserRole.HOD,
+            ),
+        }
+        expected = target_by_action.get(request.action)
+        target_role: UserRole
+        if expected is not None:
+            expected_actor, target_role = expected
+            if actor_role is not expected_actor:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="invalid handoff transition"
+                )
+        else:
+            requested_role = request.recipient_role
+            if requested_role is None or requested_role not in staff_roles:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="a staff recipient role is required",
+                )
+            target_role = requested_role
+            if (
+                actor_role is UserRole.DATA_ENTRY_OPERATOR
+                and target_role is not UserRole.NODAL_REGIONAL_OFFICER
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="DO may share only with NO"
+                )
+        if request.recipient_role is not None and request.recipient_role is not target_role:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="recipient role does not match the handoff",
+            )
+        if request.recipient_subject.strip() == context.subject:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="a chat cannot be handed off to its current owner",
+            )
+        if chat.chat_type is ChatType.PERSONAL:
+            if not request.confirm_shared_case:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="confirm sharing this private chat as a shared case",
+                )
+            if not request.case_id:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="a case_id is required to share a private chat",
+                )
+        try:
+            recipient = directory.require_recipient(
+                context,
+                role=target_role,
+                subject=request.recipient_subject,
+            )
+        except (AuthorizationDenied, StaffDirectoryError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="selected recipient is not eligible"
+            ) from error
+        now = datetime.now(UTC)
+        event = ChatHandoffEvent(
+            event_id=str(uuid4()),
+            chat_id=chat_id,
+            actor_subject=context.subject,
+            actor_role=actor_role.value,
+            recipient_subject=recipient.subject,
+            recipient_role=target_role.value,
+            action=request.action,
+            remarks=request.remarks.strip(),
+            created_at=now,
+        )
+        participant = ChatParticipant(
+            chat_id=chat_id,
+            participant_subject=recipient.subject,
+            participant_role=target_role.value,
+            access_mode=ChatAccessMode.WRITE,
+            added_by_subject=context.subject,
+            added_at=now,
+        )
+        try:
+            updated = store.apply_handoff(event, recipient=participant, case_id=request.case_id)
+        except (LookupError, PermissionError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="chat handoff is not authorized"
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)
+            ) from error
         return _chat_response(store, updated)
 
     @app.delete(
@@ -2058,7 +2721,7 @@ def create_runtime_app() -> FastAPI:
             if settings.pms_auth_mode == "local_database_demo"
             else LocalAuthService.from_settings(settings)
         )
-    return create_app(
+    app = create_app(
         PostgresServiceProvider(engine, settings),
         PostgresChatServiceProvider(engine),
         document_provider,
@@ -2072,3 +2735,14 @@ def create_runtime_app() -> FastAPI:
         staff_directory=PostgresStaffDirectory(engine),
         upload_max_bytes=settings.upload_max_mb * 1024 * 1024,
     )
+    app.state.attachment_worker = lambda context, chat_id, attachment_id, document_id: (
+        _process_chat_attachment(
+            engine,
+            settings,
+            context,
+            chat_id,
+            attachment_id,
+            document_id,
+        )
+    )
+    return app
