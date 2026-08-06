@@ -1,5 +1,6 @@
 import {
   createContext,
+  Fragment,
   FormEvent,
   type MouseEvent,
   type ReactNode,
@@ -100,6 +101,13 @@ type PageState<T> =
   | { status: "empty" }
   | { status: "error"; message: string }
   | { status: "unauthorized"; message: string };
+
+type AssistantTurn = {
+  id: string;
+  question: string;
+  answer: string;
+  grounded: GroundedAnswer | null;
+};
 
 interface RouterState {
   pathname: string;
@@ -924,7 +932,7 @@ function AssistantPage({
   timeline,
   demoActive,
   demoAnswer,
-  localAnswer,
+  turns,
   busy,
   streamingAnswer,
   streamingStage,
@@ -1077,10 +1085,10 @@ function AssistantPage({
               <div className="message-author"><span className="message-avatar"><Icon name={message.message_role === "user" ? "users" : "sparkles"} size={15} /></span><strong>{message.message_role === "assistant" ? "AI Assistant" : message.sender_subject ?? "You"}</strong><small>{new Date(message.created_at).toLocaleString()}</small></div>
               <p>{message.content}</p><CitationChips citations={message.citations} />
             </article>)}
-            {localAnswer && <>
-              <article className="assistant-message user local-check"><div className="message-author"><strong>You</strong></div><p>{localAnswer.question}</p></article>
-              <article className="assistant-message assistant local-check"><div className="message-author"><span className="message-avatar"><Icon name="sparkles" size={15} /></span><strong>AI Assistant</strong><small>Local identity check</small></div><p>{localAnswer.answer}</p></article>
-            </>}
+            {turns.map((turn) => <Fragment key={turn.id}>
+              <article className="assistant-message user"><div className="message-author"><strong>You</strong></div><p>{turn.question}</p></article>
+              <article className={`assistant-message assistant${turn.grounded ? "" : " local-check"}`}><div className="message-author"><span className="message-avatar"><Icon name="sparkles" size={15} /></span><strong>AI Assistant</strong>{turn.grounded ? <small>{turn.grounded.review_required ? "Review required" : "Grounded"}</small> : <small>Local identity check</small>}</div><p>{turn.answer}</p>{turn.grounded && <div className="citation-chips" aria-label="Citations">{turn.grounded.sources.map((source, index) => <span className="citation-chip" key={source.source_id}>[{index + 1}] {source.document_title} · p.{source.page_numbers.join(", ") || "not recorded"}</span>)}</div>}</article>
+            </Fragment>)}
             {timeline?.messages.map((message) => <article className="assistant-message case" key={message.message_id}><div className="message-author"><strong>{message.author_role}</strong><small>{new Date(message.created_at).toLocaleString()}</small></div><p>{message.body}</p></article>)}
             {busy && streamingAnswer && <article className="assistant-message assistant streaming"><div className="message-author"><span className="message-avatar"><Icon name="sparkles" size={15} /></span><strong>AI Assistant</strong></div><p>{streamingAnswer}</p></article>}
             {demoAnswer && <article className="assistant-bubble result">{demoAnswer.document ? <EvidencePanel answer={demoAnswer.document} /> : <p>{demoAnswer.answer}</p>}{demoAnswer.structured && <StructuredEvidence answer={demoAnswer} />}</article>}
@@ -1132,7 +1140,7 @@ interface AssistantProps {
   timeline: CaseTimeline | null;
   demoActive: boolean;
   demoAnswer: DemoAnswer | null;
-  localAnswer: { question: string; answer: string } | null;
+  turns: AssistantTurn[];
   busy: boolean;
   streamingAnswer: string;
   caseMessage: string;
@@ -1376,7 +1384,7 @@ function AppRuntime() {
   const [demoActive, setDemoActive] = useState(false);
   const [demoQuestion, setDemoQuestion] = useState("");
   const [demoAnswer, setDemoAnswer] = useState<DemoAnswer | null>(null);
-  const [localAnswer, setLocalAnswer] = useState<{ question: string; answer: string } | null>(null);
+  const [turns, setTurns] = useState<AssistantTurn[]>([]);
   const [streamingStage, setStreamingStage] = useState<string | null>(null);
   const [streamingAnswer, setStreamingAnswer] = useState("");
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -1508,6 +1516,7 @@ function AppRuntime() {
     setAuthenticated(false);
     setMe(null);
     setDemoAnswer(null);
+    setTurns([]);
     setTimeline(null);
     setCases([]);
     setChats([]);
@@ -1527,6 +1536,7 @@ function AppRuntime() {
     setAuthenticated(false);
     setMe(null);
     setDemoAnswer(null);
+    setTurns([]);
     setTimeline(null);
     setCases([]);
     setChats([]);
@@ -1556,7 +1566,7 @@ function AppRuntime() {
   async function selectChat(chatId: string) {
     try {
       setError(null);
-      setLocalAnswer(null);
+      setTurns([]);
       const chat = await loadChat(chatId, demoActive ? "" : accessToken);
       setSelectedChat(chat);
       navigate(`/assistant/chats/${chatId}`);
@@ -1610,7 +1620,7 @@ function AppRuntime() {
     try {
       setBusy(true);
       setError(null);
-      setLocalAnswer(null);
+      setTurns([]);
       const chat = await createChat({ title: "New Chat", chat_type: "PERSONAL" }, demoActive ? "" : accessToken);
       setSelectedChat(chat);
       await refreshChats(demoActive ? "" : accessToken);
@@ -1624,7 +1634,6 @@ function AppRuntime() {
 
   async function submitQuestion(question: string) {
     if (!question.trim() || !me || busy || activeRequest.current !== null) return;
-    setLocalAnswer(null);
     const controller = new AbortController();
     activeRequest.current = controller;
     try {
@@ -1646,9 +1655,21 @@ function AppRuntime() {
         selectedChat?.attachments.filter((item) => item.ingestion_status === "READY").map((item) => item.attachment_id) ?? []
       );
       const result = documentAnswerForWorkspace(document, me);
-      setDemoAnswer(result);
+      setDemoAnswer(null);
       setCompletionMessage("Answer validated and ready.");
       setStreamingAnswer("");
+      if (selectedChat?.chat_id) {
+        try {
+          const refreshedChat = await loadChat(selectedChat.chat_id, demoActive ? "" : accessToken);
+          setSelectedChat(refreshedChat);
+          await refreshChats(demoActive ? "" : accessToken);
+        } catch {
+          // The validated answer remains visible even if the post-stream refresh is temporarily unavailable.
+          setTurns((current) => [...current, { id: crypto.randomUUID(), question: question.trim(), answer: document.answer, grounded: document }]);
+        }
+      } else {
+        setTurns((current) => [...current, { id: crypto.randomUUID(), question: question.trim(), answer: document.answer, grounded: document }]);
+      }
       if (timeline && result.route !== "REQUEST_REFUSED" && !result.review_required) {
         await postCaseMessage(timeline.case.case_id, `Assistant result: ${result.answer}`, demoActive ? "" : accessToken);
         setTimeline(await loadTimeline(timeline.case.case_id, demoActive ? "" : accessToken));
@@ -1669,6 +1690,7 @@ function AppRuntime() {
 
   async function submitDemo(event: FormEvent) {
     event.preventDefault();
+    if (busy || activeRequest.current !== null) return;
     const question = demoQuestion.trim();
     if (!question) return;
     setLastQuestion(question);
@@ -1676,7 +1698,7 @@ function AppRuntime() {
       setDemoAnswer(null);
       setRequestError(null);
       setCompletionMessage("Local identity check complete.");
-      setLocalAnswer({ question, answer: "I'm Port AI Assistant" });
+      setTurns((current) => [...current, { id: crypto.randomUUID(), question, answer: "I'm Port AI Assistant", grounded: null }]);
       return;
     }
     await submitQuestion(question);
@@ -1685,7 +1707,7 @@ function AppRuntime() {
   function retryLastQuestion() {
     if (!lastQuestion) return;
     if (/^who are you[?!.,\s]*$/i.test(lastQuestion)) {
-      setLocalAnswer({ question: lastQuestion, answer: "I'm Port AI Assistant" });
+      setTurns((current) => [...current, { id: crypto.randomUUID(), question: lastQuestion, answer: "I'm Port AI Assistant", grounded: null }]);
       return;
     }
     void submitQuestion(lastQuestion);
@@ -1746,7 +1768,7 @@ function AppRuntime() {
     timeline,
     demoActive,
     demoAnswer,
-    localAnswer,
+    turns,
     busy,
     caseMessage,
     demoCaseMessage,
